@@ -4809,7 +4809,15 @@ class ClaudeAccountSwitcher:
             # strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
-            return True
+            #
+            # Gated on an actual strike existing (``entry.token_dead()``, no
+            # ``stored_fp`` — we can't verify which generation, so this only
+            # asks whether the count itself has reached threshold): the
+            # first check above already proved the LIVE credential doesn't
+            # carry the struck generation, so a row with zero strikes has
+            # nothing to hold — an unreadable backup on an otherwise-healthy
+            # account must not manufacture "re-login needed" out of nothing.
+            return entry.token_dead()
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )

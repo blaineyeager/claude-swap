@@ -11671,6 +11671,36 @@ class TestUnreadableBackupIsNotAbsent:
             "one unreadable pass erased the persisted struck fingerprint"
         )
 
+    # -- C-2b: the dead-token second-source check with NO strike to hold -
+
+    def test_active_slot_with_zero_strikes_and_unreadable_backup_is_not_dead(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """A transient Keychain read must not manufacture a dead verdict
+        for a row that was never struck.
+
+        The ``unreadable`` branch's own comment justifies holding a strike
+        because the row "already took AUTH_DEAD_STRIKES invalid_grants" —
+        but the code returns ``True`` unconditionally, with no check that
+        any strike actually exists. A healthy active account (zero
+        ``auth_dead_strikes``) whose backup read merely times out must not
+        be reported as "re-login needed".
+        """
+        s = self._macos_switcher(sample_sequence_data, email="b@example.com")
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        identities = {"1": ("b@example.com", "")}
+        entry = s._usage_store.entries(identities, [])["1"]
+        assert entry.auth_dead_strikes == 0, "the row must never have been struck"
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert not s._entry_token_dead(entry, "1", "b@example.com", live, True), (
+            "zero strikes plus an unreadable backup must not report dead"
+        )
+
     # -- C-3: the import auto-heal's verdict -----------------------------
 
     def test_unreadable_backup_is_not_a_dead_slot_for_import(
