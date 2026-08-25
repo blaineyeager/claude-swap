@@ -4065,6 +4065,12 @@ class ClaudeAccountSwitcher:
                 self._record_active_verdict(active)
             else:
                 creds = self._read_account_credentials(str(num), email)
+                # A transient Keychain hiccup is swallowed to "" by this bare
+                # reader. Retry once here, at the source, so every consumer —
+                # sentinel, dead-token check, token-status lines, usage fetch —
+                # sees the real creds, with nothing threaded through.
+                if not creds:
+                    creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info

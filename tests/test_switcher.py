@@ -9460,6 +9460,111 @@ class TestBackupUnreadableDisplay:
         assert s._static_usage_sentinel(info_bad) == USAGE_KEYCHAIN_UNAVAILABLE
 
 
+class TestBuildAccountsInfoRetriesEmptyBackupRead:
+    """Inactive-slot backup reads that come back "" are retried once.
+
+    ``_read_account_credentials`` swallows a transient Keychain failure to
+    "". Without a retry at ``_build_accounts_info``, that empty string is
+    what every consumer sees for the rest of the pass.
+    """
+
+    def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @staticmethod
+    def _scripted(by_num: dict[str, list[str]]):
+        """Per-slot reader: successive scripted values, then the last one."""
+        counts: dict[str, int] = {}
+
+        def side_effect(account_num: str, email: str) -> str:
+            n = counts.get(account_num, 0)
+            counts[account_num] = n + 1
+            seq = by_num[str(account_num)]
+            return seq[n] if n < len(seq) else seq[-1]
+
+        return counts, side_effect
+
+    def _rows(self, s, side_effect):
+        active = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(
+            s, "_read_active_credentials",
+            return_value=ActiveCredentials(active, False),
+        ), patch.object(
+            s, "_read_account_credentials", side_effect=side_effect,
+        ):
+            return s._build_accounts_info()
+
+    def test_transient_empty_read_is_retried_once(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        real = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
+        })
+        s = self._switcher(sample_sequence_data)
+        counts, side_effect = self._scripted({"2": ["", real]})
+        rows = {row[0]: row for row in self._rows(s, side_effect)}
+        assert rows[2][4] is False
+        assert rows[2][5] == real
+        assert counts["2"] == 2
+
+    def test_retried_credential_reaches_usage_fetch(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        real = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
+        })
+        s = self._switcher(sample_sequence_data)
+        counts, side_effect = self._scripted({"2": ["", real]})
+        active = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        with patch.object(
+            s, "_read_active_credentials",
+            return_value=ActiveCredentials(active, False),
+        ), patch.object(
+            s, "_read_account_credentials", side_effect=side_effect,
+        ), patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(None),
+        ) as mock_fetch:
+            s.list_accounts()
+
+        assert counts["2"] == 2
+        slot_calls = [c for c in mock_fetch.call_args_list if c.args[0] == "2"]
+        assert len(slot_calls) == 1
+        # credentials is the third positional arg of try_fetch_usage_for_account
+        assert slot_calls[0].args[2] == real
+
+    def test_genuinely_absent_backup_stays_empty_after_one_retry(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+
+        s = self._switcher(sample_sequence_data)
+        counts, side_effect = self._scripted({"2": ["", ""]})
+        rows = {row[0]: row for row in self._rows(s, side_effect)}
+        assert rows[2][5] == ""
+        assert counts["2"] == 2  # one retry, not a loop
+        assert s._static_usage_sentinel(rows[2]) == USAGE_NO_CREDENTIALS
+
+    def test_nonempty_first_read_is_not_retried(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        real = json.dumps({"claudeAiOauth": {"accessToken": "sk-first"}})
+        s = self._switcher(sample_sequence_data)
+        counts, side_effect = self._scripted({"2": [real]})
+        rows = {row[0]: row for row in self._rows(s, side_effect)}
+        assert rows[2][5] == real
+        assert counts["2"] == 1
+
+
 class TestSwitchUnreadableBackup:
     """M1: switching to a slot whose backup is keychain-unreadable errors
     with 'keychain locked/unavailable', never the re-add instruction."""
