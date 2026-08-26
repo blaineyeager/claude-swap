@@ -271,3 +271,43 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestHeadlessKeychainOptOut:
+    """``CLAUDE_SWAP_NO_KEYCHAIN=1`` — never open a dialog nobody can answer.
+
+    A launchd job (``LimitLoadToSessionType = Aqua``, but running while the screen
+    is shielded) cannot answer a SecurityAgent consent prompt. Before this switch
+    existed there was no way to tell cswap "this context has no human" — the only
+    lever was the reactive one, dropping to file mode *after* a Keychain op had
+    already failed, which means the dialog was already raised. Same treatment
+    ``gh`` gets from ``--insecure-storage`` and the Salesforce CLI from
+    ``SF_USE_GENERIC_UNIX_KEYCHAIN``.
+    """
+
+    def test_opt_out_forces_file_mode_on_macos(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        assert store._use_keychain() is False
+
+    def test_absent_env_leaves_macos_behaviour_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        assert store._use_keychain() is True
+
+    @pytest.mark.parametrize("value", ["0", "", "false", "no"])
+    def test_only_an_explicit_1_opts_out(self, tmp_path, monkeypatch, value):
+        # A half-set variable must not silently disable the Keychain — that would
+        # be a confusing, invisible downgrade of where credentials live.
+        monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", value)
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        assert store._use_keychain() is True
+
+    def test_opt_out_does_not_pin_file_mode_permanently(self, tmp_path, monkeypatch):
+        # The switch is a live read of the environment, not a latched state
+        # change: unsetting it restores Keychain use without a fresh process.
+        monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        assert store._use_keychain() is False
+        monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN")
+        assert store._use_keychain() is True
