@@ -35,6 +35,7 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
@@ -59,6 +60,77 @@ _TIMEOUT = 5.0
 # PATH must not be able to intercept secrets. ``/usr/bin/security`` is present on
 # every macOS.
 _SECURITY = "/usr/bin/security"
+
+# Overrides ``_TIMEOUT``. A host that can actually draw a Keychain dialog wants
+# longer than 5s so a human gets a chance to answer before anything is killed;
+# a headless one wants the short default. Garbage values fall back rather than
+# meaning "no deadline" (a hang) or "kill instantly".
+_TIMEOUT_ENV = "CLAUDE_SWAP_KEYCHAIN_TIMEOUT"
+
+# How long a timed-out ``security`` gets to unwind after SIGTERM before SIGKILL.
+# It only has to withdraw its SecurityAgent query, so this is generous.
+_TERM_GRACE = 2.0
+
+
+def _timeout() -> float:
+    """The per-spawn deadline: :data:`_TIMEOUT`, or a sane ``_TIMEOUT_ENV``."""
+    raw = os.environ.get(_TIMEOUT_ENV)
+    if not raw:
+        return _TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _TIMEOUT
+    if not math.isfinite(value) or value <= 0:
+        return _TIMEOUT
+    return value
+
+
+def _run_security(
+    argv: list[str],
+    *,
+    input: str | None = None,  # noqa: A002 - mirrors subprocess.run's name
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Spawn ``security``, escalating SIGTERM -> SIGKILL if it overruns.
+
+    Drop-in for ``subprocess.run(..., capture_output=True, text=True)``: same
+    :class:`subprocess.CompletedProcess` out, same :class:`subprocess.TimeoutExpired`
+    on overrun, so every caller's error handling is unchanged.
+
+    The one difference is the signal, and it is the whole point.
+    ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is parked on
+    a SecurityAgent consent dialog that cannot be drawn (shielded screen, headless
+    launchd job), SIGKILL makes it vanish with an XPC query still registered;
+    ``securityd`` then destroys a still-held mutex tearing that query down, gets
+    ``EBUSY``, and the uncaught ``Security::UnixError`` aborts the daemon. Since
+    the login keychain's master key lives only in that process's memory, the
+    respawn comes up locked and every app on the machine re-prompts for the
+    keychain password. SIGTERM lets ``security`` withdraw the query first.
+    """
+    if timeout is None:
+        timeout = _timeout()
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=_TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            # Wedged past SIGTERM. Now SIGKILL is the only option left, and a
+            # child this stuck was never going to unwind cleanly anyway.
+            proc.kill()
+            proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
 
 # Fallback if ``claude`` is not on PATH at write time (e.g. a launchd/cron job
 # with a stripped PATH) — the standalone-CLI install location, matching most
@@ -167,11 +239,9 @@ def get_password(service: str, account: str) -> str | None:
     failure.
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
@@ -200,11 +270,9 @@ def item_exists(service: str, account: str) -> bool:
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -232,12 +300,10 @@ def set_password(service: str, account: str, password: str) -> None:
     )
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
+            result = _run_security(
                 [_SECURITY, "-i"],
                 input=command,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
+                timeout=_timeout(),
             )
         else:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
@@ -247,11 +313,9 @@ def set_password(service: str, account: str, password: str) -> None:
             for trusted_path in _trusted_app_paths():
                 argv += ["-T", trusted_path]
             argv += ["-X", hex_value]
-            result = subprocess.run(
+            result = _run_security(
                 argv,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
+                timeout=_timeout(),
             )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
@@ -270,11 +334,9 @@ def delete_password(service: str, account: str) -> None:
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
