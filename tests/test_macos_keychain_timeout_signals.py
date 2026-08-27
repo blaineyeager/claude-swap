@@ -1,0 +1,163 @@
+"""How a timed-out ``security`` spawn is killed — SIGTERM first, SIGKILL last.
+
+Why this file exists: ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the
+``security`` child is blocked on a SecurityAgent consent dialog that nobody can
+answer (a shielded screen, or a headless launchd job), SIGKILL makes it vanish
+with an outstanding XPC query still registered. ``securityd`` then tears that
+query down, calls ``pthread_mutex_destroy`` on a still-held mutex, gets ``EBUSY``,
+and the uncaught ``Security::UnixError`` reaches ``std::terminate`` -> ``abort()``.
+
+The daemon dying is what actually hurts: the login keychain's master key lives
+only in ``securityd``'s memory, so the respawn comes up **locked** and every app
+on the machine re-prompts for the keychain password. Observed on 2026-08-25/26 as
+16 ``securityd`` SIGABRT reports, with prompt-to-abort intervals of 4.877s and
+4.970s against this module's 5.0s deadline; a prompt answered in 4.15s produced
+no abort.
+
+SIGTERM lets ``security`` unwind its own SecurityAgent query before exiting, so
+the daemon never has an abandoned one to destroy. These tests assert the signal
+*order*, because which signal is sent is the entire bug.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from unittest.mock import patch
+
+import pytest
+
+from claude_swap import macos_keychain
+
+pytestmark = pytest.mark.no_keychain_fake
+
+
+class _FakeProc:
+    """``Popen`` stand-in that hangs until signalled, recording what it got.
+
+    ``dies_on_term=False`` models a child wedged so hard SIGTERM doesn't land —
+    the only case where escalating to SIGKILL is correct.
+    """
+
+    def __init__(self, *, dies_on_term: bool = True):
+        self.signals: list[str] = []
+        self.returncode: int | None = None
+        self._dies_on_term = dies_on_term
+
+    def communicate(self, input=None, timeout=None):  # noqa: A002 - Popen's name
+        if "kill" in self.signals:
+            self.returncode = -9
+            return ("", "")
+        if "terminate" in self.signals and self._dies_on_term:
+            self.returncode = -15
+            return ("", "")
+        raise subprocess.TimeoutExpired(cmd="security", timeout=timeout or 0)
+
+    def terminate(self):
+        self.signals.append("terminate")
+
+    def kill(self):
+        self.signals.append("kill")
+
+
+# ---------------------------------------------------------------------------
+# signal order
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_sends_sigterm_and_stops_there_when_the_child_exits():
+    proc = _FakeProc(dies_on_term=True)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    # SIGKILL is what orphans securityd's query — a child that answers SIGTERM
+    # must never be escalated to.
+    assert proc.signals == ["terminate"]
+
+
+def test_timeout_escalates_to_sigkill_only_after_sigterm_is_ignored():
+    proc = _FakeProc(dies_on_term=False)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert proc.signals == ["terminate", "kill"]
+
+
+def test_timeout_still_surfaces_as_keychain_error_through_the_wrappers():
+    # The public contract is unchanged: a wedged Keychain is a KeychainError,
+    # never a hang and never a bare TimeoutExpired escaping the module.
+    with patch(
+        "claude_swap.macos_keychain.subprocess.Popen",
+        side_effect=lambda *a, **k: _FakeProc(dies_on_term=True),
+    ):
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.get_password("svc", "acct")
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.set_password("svc", "acct", "secret")
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.delete_password("svc", "acct")
+        # item_exists is deliberately non-raising.
+        assert macos_keychain.item_exists("svc", "acct") is False
+
+
+# ---------------------------------------------------------------------------
+# the real thing — a live child process, no mocks
+# ---------------------------------------------------------------------------
+
+
+def test_real_child_receives_sigterm_not_sigkill(tmp_path):
+    marker = tmp_path / "signal.txt"
+    child = (
+        "import signal, sys, time\n"
+        f"open({str(marker)!r}, 'w').write('running')\n"
+        "def handler(signum, frame):\n"
+        f"    open({str(marker)!r}, 'w').write('SIGTERM')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, handler)\n"
+        "time.sleep(30)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        macos_keychain._run_security([sys.executable, "-c", child], timeout=0.75)
+    # A SIGKILLed child cannot write this; only a handled SIGTERM can.
+    assert marker.read_text() == "SIGTERM"
+
+
+def test_real_child_ignoring_sigterm_is_still_reaped(tmp_path):
+    child = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n"
+    )
+    with patch.object(macos_keychain, "_TERM_GRACE", 0.4):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security([sys.executable, "-c", child], timeout=0.4)
+    # Reaching here at all means the escalation path completed rather than
+    # blocking forever on a child that refuses to leave.
+
+
+# ---------------------------------------------------------------------------
+# the deadline itself
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_defaults_to_the_module_constant(monkeypatch):
+    monkeypatch.delenv(macos_keychain._TIMEOUT_ENV, raising=False)
+    assert macos_keychain._timeout() == macos_keychain._TIMEOUT
+
+
+def test_timeout_honours_the_env_override(monkeypatch):
+    # A host that can actually draw a dialog wants longer than 5s, so the human
+    # gets a chance to answer before anything is killed at all.
+    monkeypatch.setenv(macos_keychain._TIMEOUT_ENV, "20")
+    assert macos_keychain._timeout() == 20.0
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "-1", "0", "nan"])
+def test_timeout_ignores_a_garbage_override(monkeypatch, bad):
+    # Never let a typo'd env var mean "no deadline" (a hang) or "kill instantly".
+    monkeypatch.setenv(macos_keychain._TIMEOUT_ENV, bad)
+    assert macos_keychain._timeout() == macos_keychain._TIMEOUT

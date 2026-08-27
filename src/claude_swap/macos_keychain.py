@@ -35,7 +35,9 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import math
 import os
+import shutil
 import subprocess
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -58,6 +60,131 @@ _TIMEOUT = 5.0
 # PATH must not be able to intercept secrets. ``/usr/bin/security`` is present on
 # every macOS.
 _SECURITY = "/usr/bin/security"
+
+# Overrides ``_TIMEOUT``. A host that can actually draw a Keychain dialog wants
+# longer than 5s so a human gets a chance to answer before anything is killed;
+# a headless one wants the short default. Garbage values fall back rather than
+# meaning "no deadline" (a hang) or "kill instantly".
+_TIMEOUT_ENV = "CLAUDE_SWAP_KEYCHAIN_TIMEOUT"
+
+# How long a timed-out ``security`` gets to unwind after SIGTERM before SIGKILL.
+# It only has to withdraw its SecurityAgent query, so this is generous.
+_TERM_GRACE = 2.0
+
+
+def _timeout() -> float:
+    """The per-spawn deadline: :data:`_TIMEOUT`, or a sane ``_TIMEOUT_ENV``."""
+    raw = os.environ.get(_TIMEOUT_ENV)
+    if not raw:
+        return _TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _TIMEOUT
+    if not math.isfinite(value) or value <= 0:
+        return _TIMEOUT
+    return value
+
+
+def _run_security(
+    argv: list[str],
+    *,
+    input: str | None = None,  # noqa: A002 - mirrors subprocess.run's name
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Spawn ``security``, escalating SIGTERM -> SIGKILL if it overruns.
+
+    Drop-in for ``subprocess.run(..., capture_output=True, text=True)``: same
+    :class:`subprocess.CompletedProcess` out, same :class:`subprocess.TimeoutExpired`
+    on overrun, so every caller's error handling is unchanged.
+
+    The one difference is the signal, and it is the whole point.
+    ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is parked on
+    a SecurityAgent consent dialog that cannot be drawn (shielded screen, headless
+    launchd job), SIGKILL makes it vanish with an XPC query still registered;
+    ``securityd`` then destroys a still-held mutex tearing that query down, gets
+    ``EBUSY``, and the uncaught ``Security::UnixError`` aborts the daemon. Since
+    the login keychain's master key lives only in that process's memory, the
+    respawn comes up locked and every app on the machine re-prompts for the
+    keychain password. SIGTERM lets ``security`` withdraw the query first.
+    """
+    if timeout is None:
+        timeout = _timeout()
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=_TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            # Wedged past SIGTERM. Now SIGKILL is the only option left, and a
+            # child this stuck was never going to unwind cleanly anyway.
+            proc.kill()
+            proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+# Fallback if ``claude`` is not on PATH at write time (e.g. a launchd/cron job
+# with a stripped PATH) — the standalone-CLI install location, matching most
+# hosts' actual layout. ``_trusted_app_paths`` tries ``PATH`` first.
+_CLAUDE_FALLBACK_PATH = os.path.expanduser("~/.local/bin/claude")
+
+
+def _trusted_app_paths() -> list[str]:
+    """Applications to grant no-prompt access to every Keychain item this module
+    writes, via ``security add-generic-password -T``.
+
+    Why this exists: ``set_password`` uses ``-U`` (update-or-create). Per
+    ``security``'s own semantics, omitting ``-T`` on a write does NOT mean "leave
+    the existing ACL alone" — it means "trust only the process performing this
+    write" (``/usr/bin/security`` itself here). That's fine for *this* module's
+    own reads (see the module docstring: creator == reader == ``security``), but
+    Claude Code reads the same "Claude Code-credentials" item **in-process** via
+    its own Security.framework call, a different, untrusted app. Every ``cswap``
+    rotation was silently re-pinning the ACL to "security only," so Claude Code's
+    next read had to fall back to a GUI "wants to use your keychain" prompt — one
+    that never gets answered in a headless/launchd daemon, surfacing as "OAuth
+    session expired and could not be refreshed" even though the credential itself
+    (and its ``expiresAt``) was fine.
+
+    Deliberately NEVER pass ``-T ""`` — that is macOS's own footgun: an *empty*
+    ``-T`` means "trust every application," not "trust none."
+
+    Trust here is anchored to the binary's **code signature** (Developer ID cert
+    + Team ID + bundle identifier), not the literal file path — that's how macOS
+    keychain ACLs evaluate a trusted-application entry. So resolving ``claude``
+    via ``PATH``/``shutil.which`` each call (rather than hardcoding today's
+    version-pinned binary under ``~/.local/share/claude/versions/<X.Y.Z>``, which
+    a self-update deletes) is both simpler AND durable: the grant is computed
+    from whatever the live, currently-signed ``claude`` binary is at write time,
+    and continues to match future Anthropic-signed builds of the same identity.
+
+    ``/usr/bin/security`` is included explicitly: specifying ``-T`` at all drops
+    the implicit "trust the calling process" default, so without listing it here
+    this module's OWN future reads (via ``get_password``) would themselves start
+    prompting.
+
+    Does NOT include the ``cswap`` Python interpreter — this module deliberately
+    never touches Keychain items except through the ``security`` CLI (that's the
+    whole point of the module docstring's "creator == reader" design), so a
+    separate grant for the venv's ``python3`` would be redundant and, being a
+    ``uv``-managed venv path, less stable than ``/usr/bin/security`` itself.
+    """
+    paths = [_SECURITY]
+    claude_path = shutil.which("claude") or (
+        _CLAUDE_FALLBACK_PATH if os.path.exists(_CLAUDE_FALLBACK_PATH) else None
+    )
+    if claude_path:
+        paths.append(claude_path)
+    return paths
 
 
 class KeychainError(Exception):
@@ -112,11 +239,9 @@ def get_password(service: str, account: str) -> str | None:
     failure.
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
@@ -145,11 +270,9 @@ def item_exists(service: str, account: str) -> bool:
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -162,34 +285,37 @@ def set_password(service: str, account: str, password: str) -> None:
     Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
     argv only for payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
+
+    Every write stamps the trusted-application ACL via ``-T`` (see
+    :func:`_trusted_app_paths`) so the item stays readable by Claude Code itself,
+    not just by this module — ``-U`` otherwise resets the ACL to "creator only"
+    on every call, which silently locked Claude Code out after each rotation.
     """
     hex_value = password.encode("utf-8").hex()
+    trust_args = "".join(f"-T {_quote(p)} " for p in _trusted_app_paths())
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
     command = (
         f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
-        f"-X {hex_value}\n"
+        f"{trust_args}-X {hex_value}\n"
     )
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
+            result = _run_security(
                 [_SECURITY, "-i"],
                 input=command,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
+                timeout=_timeout(),
             )
         else:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
-            result = subprocess.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
+            argv = [_SECURITY, "add-generic-password", "-U", "-a", account, "-s", service]
+            for trusted_path in _trusted_app_paths():
+                argv += ["-T", trusted_path]
+            argv += ["-X", hex_value]
+            result = _run_security(
+                argv,
+                timeout=_timeout(),
             )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(
@@ -208,11 +334,9 @@ def delete_password(service: str, account: str) -> None:
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
     try:
-        result = subprocess.run(
+        result = _run_security(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=_TIMEOUT,
+            timeout=_timeout(),
         )
     except subprocess.TimeoutExpired as e:
         raise KeychainError(

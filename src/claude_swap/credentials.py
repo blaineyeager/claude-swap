@@ -140,6 +140,15 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # instead of disabling the Keychain for the whole process lifetime.
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
 
+# Opt out of the Keychain entirely, for a context with no human to answer a
+# SecurityAgent consent dialog: a launchd job running while the screen is
+# shielded, CI, or an SSH session. Without it the only lever is the reactive one
+# -- drop to file mode *after* a Keychain op fails -- by which point the dialog
+# has already been raised and left hanging. Mirrors ``gh --insecure-storage`` and
+# ``SF_USE_GENERIC_UNIX_KEYCHAIN``. Deliberately exact-match "1": a half-set
+# variable must not silently move where credentials live.
+NO_KEYCHAIN_ENV = "CLAUDE_SWAP_NO_KEYCHAIN"
+
 
 class ActiveCredentials(NamedTuple):
     """Outcome of reading Claude Code's active credential.
@@ -387,7 +396,8 @@ class CredentialStore:
     def _use_keychain(self) -> bool:
         """Whether credential ops should target the macOS Keychain right now.
 
-        ``False`` off macOS. On macOS, ``True`` until a Keychain op fails, which
+        ``False`` off macOS, and ``False`` whenever ``NO_KEYCHAIN_ENV`` is set to
+        ``"1"``. On macOS, otherwise ``True`` until a Keychain op fails, which
         drops to file mode. That failure records a re-probe deadline
         (``KEYCHAIN_RECHECK_COOLDOWN_S``): within one CLI invocation the deadline
         never passes, so a command can't split-brain between backends, but a
@@ -397,6 +407,8 @@ class CredentialStore:
         :meth:`_pin_file_mode` for why a write fallback must never re-probe.
         """
         if self._host.platform != Platform.MACOS:
+            return False
+        if os.environ.get(NO_KEYCHAIN_ENV) == "1":
             return False
         if (
             self._keychain_usable_cache is False
@@ -951,6 +963,36 @@ class CredentialStore:
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
 
+    def _warn_if_oauth_missing_expires_at(self, credentials: str) -> None:
+        """Log (never raise) if the OAuth payload about to reach the Keychain is
+        missing ``claudeAiOauth.expiresAt``.
+
+        ``macos_keychain.set_password`` hex-round-trips ``credentials`` byte for
+        byte — it cannot itself drop a field. This is a pass-through sanity check
+        one layer up: an ``expiresAt``-less credential has been observed reaching
+        the active Keychain item while the ``.credentials.json`` file copy was
+        valid, meaning whatever upstream call built ``working``/``rollback_creds``
+        for this write occasionally supplies a stale or partial lineage. Surfacing
+        that here, at the single choke point every OAuth write passes through,
+        beats tracing every producer — and a missing ``expiresAt`` makes Claude
+        Code treat a token as already-expired (``is_oauth_token_expired`` prefers
+        expired-on-error), which reads exactly like the "session expired" reports
+        this was written to explain. Best-effort: a malformed (non-JSON) payload
+        is `CredentialWriteError`'s problem, not this check's — swallow and move
+        on rather than blocking the write over a diagnostic.
+        """
+        try:
+            data = json.loads(credentials)
+            oauth = data.get("claudeAiOauth") or {}
+            if not oauth.get("expiresAt"):
+                self._host._logger.warning(
+                    "OAuth credential about to be written to the Keychain has no "
+                    "claudeAiOauth.expiresAt — Claude Code will likely treat it as "
+                    "already expired. Writing anyway (never silently dropped)."
+                )
+        except Exception:
+            pass
+
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
 
@@ -972,6 +1014,7 @@ class CredentialStore:
             CredentialWriteError: If writing credentials fails.
         """
         if self._use_keychain():
+            self._warn_if_oauth_missing_expires_at(credentials)
             try:
                 self._kc_call(
                     macos_keychain.set_password,
