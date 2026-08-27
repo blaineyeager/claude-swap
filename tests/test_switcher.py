@@ -6002,6 +6002,71 @@ class TestMacosKeychainFallback:
         # The legacy value-only contract still reads as empty.
         assert s._read_credentials() == ""
 
+    def test_pinned_file_mode_recovers_live_keychain_when_file_empty(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """A write-fallback pins file mode for the process. If that file is
+        later gone (Claude Code is keychain-only on macOS), an empty read
+        must not be treated as "no credentials" — the live login is still in
+        the Keychain. Regression: a long-running TUI refused "Switch to
+        account 2" because ``_read_credentials()`` returned "" and the
+        switcher would not overwrite the departing slot's backup.
+        """
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live",
+                "refreshToken": "rt-live",
+            }
+        })
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = live
+        s._store._pin_file_mode(residual_cleared=True)
+        assert not get_credentials_path().exists()
+        assert s._use_keychain() is False
+
+        result = s._read_active_credentials()
+        assert result.value == live
+        assert result.keychain_unavailable is False
+        assert s._read_credentials() == live
+        # A proven-live Keychain must take writes again, or the switch
+        # would snapshot the outgoing token then park the incoming one
+        # in a file Claude Code never reads.
+        assert s._use_keychain() is True
+
+    def test_pinned_file_mode_recovery_honors_no_keychain_opt_out(
+        self, temp_home: Path, block_real_keychain, monkeypatch
+    ):
+        """Launchd sets ``CLAUDE_SWAP_NO_KEYCHAIN=1`` so it cannot raise a
+        SecurityAgent dialog. Recovery must not undo that opt-out just
+        because a pin left the file empty.
+        """
+        monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "FROM-KC"
+        s._store._pin_file_mode(residual_cleared=True)
+        result = s._read_active_credentials()
+        assert result.value == ""
+        assert s._use_keychain() is False
+
+    def test_pinned_file_mode_does_not_recover_unverified_residual(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """An unverified clear may have left a spent generation in Keychain.
+        Recovering it as live would POST it and quarantine a live account.
+        """
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = (
+            "STALE-RESIDUAL"
+        )
+        s._store._pin_file_mode(residual_cleared=False)
+        result = s._read_active_credentials()
+        assert result.value == ""
+        assert result.degraded is True
+        assert s._use_keychain() is False
+
     def test_active_read_keychain_failure_covered_by_file(
         self, temp_home: Path, monkeypatch, block_real_keychain
     ):
