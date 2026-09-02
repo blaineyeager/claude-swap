@@ -1,4 +1,4 @@
-"""How a timed-out ``security`` spawn is killed — SIGTERM first, SIGKILL last.
+"""How a timed-out ``security`` spawn is stopped — SIGTERM only, never SIGKILL.
 
 Why this file exists: ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the
 ``security`` child is blocked on a SecurityAgent consent dialog that nobody can
@@ -12,11 +12,13 @@ only in ``securityd``'s memory, so the respawn comes up **locked** and every app
 on the machine re-prompts for the keychain password. Observed on 2026-08-25/26 as
 16 ``securityd`` SIGABRT reports, with prompt-to-abort intervals of 4.877s and
 4.970s against this module's 5.0s deadline; a prompt answered in 4.15s produced
-no abort.
+no abort. Recurred 2026-09-02: SIGTERM-then-SIGKILL after 2s still SIGKILLed a
+``security find-generic-password`` parked on the unlock dialog, aborted
+``securityd`` twice at 14:42, and locked iMessage / Claude Code.
 
-SIGTERM lets ``security`` unwind its own SecurityAgent query before exiting, so
-the daemon never has an abandoned one to destroy. These tests assert the signal
-*order*, because which signal is sent is the entire bug.
+SIGTERM lets ``security`` unwind its own SecurityAgent query before exiting.
+If it does not exit in the grace period, SIGKILL is still the bug — leave the
+child. These tests assert SIGKILL is never sent.
 """
 
 from __future__ import annotations
@@ -36,12 +38,13 @@ class _FakeProc:
     """``Popen`` stand-in that hangs until signalled, recording what it got.
 
     ``dies_on_term=False`` models a child wedged so hard SIGTERM doesn't land —
-    the only case where escalating to SIGKILL is correct.
+    the case that used to escalate to SIGKILL and abort securityd.
     """
 
     def __init__(self, *, dies_on_term: bool = True):
         self.signals: list[str] = []
         self.returncode: int | None = None
+        self.stdin = self.stdout = self.stderr = None
         self._dies_on_term = dies_on_term
 
     def communicate(self, input=None, timeout=None):  # noqa: A002 - Popen's name
@@ -77,14 +80,16 @@ def test_timeout_sends_sigterm_and_stops_there_when_the_child_exits():
     assert proc.signals == ["terminate"]
 
 
-def test_timeout_escalates_to_sigkill_only_after_sigterm_is_ignored():
+def test_timeout_never_sends_sigkill_even_if_sigterm_is_ignored():
     proc = _FakeProc(dies_on_term=False)
     with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
         with pytest.raises(subprocess.TimeoutExpired):
             macos_keychain._run_security(
                 [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
             )
-    assert proc.signals == ["terminate", "kill"]
+    # A SIGTERM-deaf security(1) parked on SecurityAgent is the crash:
+    # SIGKILL orphans the query and securityd aborts. Leave the child.
+    assert proc.signals == ["terminate"]
 
 
 def test_timeout_still_surfaces_as_keychain_error_through_the_wrappers():
@@ -126,17 +131,32 @@ def test_real_child_receives_sigterm_not_sigkill(tmp_path):
     assert marker.read_text() == "SIGTERM"
 
 
-def test_real_child_ignoring_sigterm_is_still_reaped(tmp_path):
+def test_real_child_ignoring_sigterm_is_not_sigkilled():
     child = (
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "time.sleep(30)\n"
     )
-    with patch.object(macos_keychain, "_TERM_GRACE", 0.4):
+    real_popen = subprocess.Popen
+    holder: dict[str, subprocess.Popen[str]] = {}
+
+    def spy(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        holder["proc"] = proc
+        return proc
+
+    with patch.object(macos_keychain, "_TERM_GRACE", 0.4), patch(
+        "claude_swap.macos_keychain.subprocess.Popen", side_effect=spy
+    ):
         with pytest.raises(subprocess.TimeoutExpired):
             macos_keychain._run_security([sys.executable, "-c", child], timeout=0.4)
-    # Reaching here at all means the escalation path completed rather than
-    # blocking forever on a child that refuses to leave.
+    proc = holder["proc"]
+    try:
+        # Still running: we raised TimeoutExpired without SIGKILL.
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=2)
 
 
 # ---------------------------------------------------------------------------

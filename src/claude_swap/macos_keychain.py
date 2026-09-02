@@ -67,8 +67,8 @@ _SECURITY = "/usr/bin/security"
 # meaning "no deadline" (a hang) or "kill instantly".
 _TIMEOUT_ENV = "CLAUDE_SWAP_KEYCHAIN_TIMEOUT"
 
-# How long a timed-out ``security`` gets to unwind after SIGTERM before SIGKILL.
-# It only has to withdraw its SecurityAgent query, so this is generous.
+# How long a timed-out ``security`` gets to unwind after SIGTERM. If it is
+# still alive after this, we leave it — SIGKILL is what aborts securityd.
 _TERM_GRACE = 2.0
 
 
@@ -86,13 +86,24 @@ def _timeout() -> float:
     return value
 
 
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Drop our ends of a leftover child's pipes so *this* process does not leak FDs."""
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def _run_security(
     argv: list[str],
     *,
     input: str | None = None,  # noqa: A002 - mirrors subprocess.run's name
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Spawn ``security``, escalating SIGTERM -> SIGKILL if it overruns.
+    """Spawn ``security``, sending SIGTERM on overrun — never SIGKILL.
 
     Drop-in for ``subprocess.run(..., capture_output=True, text=True)``: same
     :class:`subprocess.CompletedProcess` out, same :class:`subprocess.TimeoutExpired`
@@ -107,6 +118,12 @@ def _run_security(
     the login keychain's master key lives only in that process's memory, the
     respawn comes up locked and every app on the machine re-prompts for the
     keychain password. SIGTERM lets ``security`` withdraw the query first.
+
+    If SIGTERM is not processed in ``_TERM_GRACE`` seconds, leave the child.
+    Escalating to SIGKILL is the crash (measured 2026-08-26 and again
+    2026-09-02): a ``security find-generic-password`` parked on the unlock
+    dialog does not handle SIGTERM until the dialog returns, so the 2s grace
+    expires and SIGKILL aborts securityd anyway.
     """
     if timeout is None:
         timeout = _timeout()
@@ -124,10 +141,9 @@ def _run_security(
         try:
             proc.communicate(timeout=_TERM_GRACE)
         except subprocess.TimeoutExpired:
-            # Wedged past SIGTERM. Now SIGKILL is the only option left, and a
-            # child this stuck was never going to unwind cleanly anyway.
-            proc.kill()
-            proc.communicate()
+            # Do not SIGKILL. A child this stuck is almost certainly blocked
+            # in SecurityAgent; killing it is what aborts securityd.
+            _close_pipes(proc)
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
