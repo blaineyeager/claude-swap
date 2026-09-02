@@ -23,6 +23,7 @@ child. These tests assert SIGKILL is never sent.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from unittest.mock import patch
@@ -32,6 +33,12 @@ import pytest
 from claude_swap import macos_keychain
 
 pytestmark = pytest.mark.no_keychain_fake
+
+
+@pytest.fixture(autouse=True)
+def _isolate_keychain_log(tmp_path, monkeypatch):
+    """Timeout logging must never touch the real ~/.claude state dir in tests."""
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "kc.jsonl"))
 
 
 class _FakeProc:
@@ -44,6 +51,7 @@ class _FakeProc:
     def __init__(self, *, dies_on_term: bool = True):
         self.signals: list[str] = []
         self.returncode: int | None = None
+        self.pid: int | None = None
         self.stdin = self.stdout = self.stderr = None
         self._dies_on_term = dies_on_term
 
@@ -61,6 +69,9 @@ class _FakeProc:
 
     def kill(self):
         self.signals.append("kill")
+
+    def poll(self):
+        return self.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +168,78 @@ def test_real_child_ignoring_sigterm_is_not_sigkilled():
     finally:
         proc.kill()
         proc.wait(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# timeout breadcrumb (no secrets) — next incident's first read
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_security_argv_redacts_hex_payloads():
+    argv = [
+        "/usr/bin/security",
+        "add-generic-password",
+        "-U",
+        "-a",
+        "byeager",
+        "-s",
+        "Claude Code-credentials",
+        "-X",
+        "deadbeefcafesecret",
+    ]
+    out = macos_keychain._sanitize_security_argv(argv)
+    assert "deadbeefcafesecret" not in out
+    assert "-X" in out
+    assert "<redacted>" in out
+    assert "Claude Code-credentials" in out
+
+
+def test_timeout_appends_jsonl_breadcrumb(tmp_path, monkeypatch):
+    log_path = tmp_path / "kc.jsonl"
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(log_path))
+    monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
+    proc = _FakeProc(dies_on_term=False)
+    proc.pid = 4242
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [
+                    macos_keychain._SECURITY,
+                    "find-generic-password",
+                    "-a",
+                    "byeager",
+                    "-w",
+                    "-s",
+                    "Claude Code-credentials",
+                ],
+                timeout=0.01,
+            )
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["event"] == "security_timeout"
+    assert row["child_alive_after_term"] is True
+    assert row["no_keychain"] is True
+    assert row["child_pid"] == 4242
+    dumped = json.dumps(row)
+    assert "sk-ant" not in dumped
+    assert "-X" not in dumped or "<redacted>" in dumped
+    assert "find-generic-password" in dumped
+
+
+def test_timeout_log_failure_does_not_break_the_timeout_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "nope" / "kc.jsonl"))
+    with patch(
+        "claude_swap.macos_keychain._keychain_log_path",
+        side_effect=OSError("disk full"),
+    ):
+        proc = _FakeProc(dies_on_term=True)
+        with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+            with pytest.raises(subprocess.TimeoutExpired):
+                macos_keychain._run_security(
+                    [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+                )
+    assert proc.signals == ["terminate"]
 
 
 # ---------------------------------------------------------------------------

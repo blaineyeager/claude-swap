@@ -35,10 +35,14 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
 import subprocess
+import sys
+import time
+from pathlib import Path
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
@@ -70,6 +74,67 @@ _TIMEOUT_ENV = "CLAUDE_SWAP_KEYCHAIN_TIMEOUT"
 # How long a timed-out ``security`` gets to unwind after SIGTERM. If it is
 # still alive after this, we leave it — SIGKILL is what aborts securityd.
 _TERM_GRACE = 2.0
+
+# JSONL breadcrumb for the next keychain-dialog incident. Override in tests.
+# Never write secrets here: see ``_sanitize_security_argv``.
+_LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
+
+
+def _keychain_log_path() -> Path:
+    raw = os.environ.get(_LOG_ENV)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".claude" / "state" / "keychain-watch" / "cswap-keychain.jsonl"
+
+
+def _sanitize_security_argv(argv: list[str]) -> list[str]:
+    """Drop hex payloads (``-X``) so a timeout log cannot leak a credential."""
+    out: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+            continue
+        if arg == "-X":
+            out.append(arg)
+            redact_next = True
+            continue
+        if arg.startswith("-X") and arg != "-X":
+            out.append("-X<redacted>")
+            continue
+        if arg == "-p":
+            out.append(arg)
+            redact_next = True
+            continue
+        out.append(arg)
+    return out
+
+
+def _caller_argv() -> list[str]:
+    """cswap's own argv, truncated and stripped of anything that looks like a token."""
+    out: list[str] = []
+    for arg in sys.argv[:6]:
+        if arg.startswith("sk-ant") or len(arg) > 80:
+            out.append("<redacted>")
+        else:
+            out.append(arg)
+    return out
+
+
+def _log_security_event(payload: dict) -> None:
+    """Append one JSON line. Must never raise — logging is best-effort."""
+    try:
+        path = _keychain_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **payload,
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        return
 
 
 def _timeout() -> float:
@@ -138,12 +203,29 @@ def _run_security(
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.terminate()
+        left_alive = False
         try:
             proc.communicate(timeout=_TERM_GRACE)
         except subprocess.TimeoutExpired:
             # Do not SIGKILL. A child this stuck is almost certainly blocked
             # in SecurityAgent; killing it is what aborts securityd.
             _close_pipes(proc)
+            poll = getattr(proc, "poll", None)
+            left_alive = poll() is None if callable(poll) else proc.returncode is None
+        _log_security_event(
+            {
+                "event": "security_timeout",
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "child_pid": getattr(proc, "pid", None),
+                "child_alive_after_term": left_alive,
+                "timeout_s": timeout,
+                "term_grace_s": _TERM_GRACE,
+                "argv": _sanitize_security_argv([str(a) for a in argv]),
+                "cswap_argv": _caller_argv(),
+                "no_keychain": os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1",
+            }
+        )
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
