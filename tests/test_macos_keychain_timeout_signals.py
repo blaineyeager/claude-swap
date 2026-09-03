@@ -39,6 +39,12 @@ pytestmark = pytest.mark.no_keychain_fake
 def _isolate_keychain_log(tmp_path, monkeypatch):
     """Timeout logging must never touch the real ~/.claude state dir in tests."""
     monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "kc.jsonl"))
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT", str(tmp_path / "circuit.json"))
+    monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+    # Live SecurityAgent must not flip these tests onto the no-signal path.
+    monkeypatch.setattr(macos_keychain, "_ps_text", lambda: "", raising=False)
+    if hasattr(macos_keychain, "_left_alive"):
+        macos_keychain._left_alive = None
 
 
 class _FakeProc:
@@ -197,7 +203,6 @@ def test_sanitize_security_argv_redacts_hex_payloads():
 def test_timeout_appends_jsonl_breadcrumb(tmp_path, monkeypatch):
     log_path = tmp_path / "kc.jsonl"
     monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(log_path))
-    monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
     proc = _FakeProc(dies_on_term=False)
     proc.pid = 4242
     with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
@@ -219,7 +224,7 @@ def test_timeout_appends_jsonl_breadcrumb(tmp_path, monkeypatch):
     row = json.loads(lines[0])
     assert row["event"] == "security_timeout"
     assert row["child_alive_after_term"] is True
-    assert row["no_keychain"] is True
+    assert row["no_keychain"] is False
     assert row["child_pid"] == 4242
     dumped = json.dumps(row)
     assert "sk-ant" not in dumped
@@ -264,3 +269,73 @@ def test_timeout_ignores_a_garbage_override(monkeypatch, bad):
     # Never let a typo'd env var mean "no deadline" (a hang) or "kill instantly".
     monkeypatch.setenv(macos_keychain._TIMEOUT_ENV, bad)
     assert macos_keychain._timeout() == macos_keychain._TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# timeout signal split — dialog up: no signal; otherwise SIGTERM, never SIGKILL
+# ---------------------------------------------------------------------------
+
+
+class _Pipe:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_timeout_while_dialog_busy_sends_no_signal(tmp_path, monkeypatch):
+    """A child already parked on SecurityAgent must be left alone.
+
+    SIGTERM is not processed until the dialog returns; the old grace then
+    expired and SIGKILL aborted securityd. Close our pipes and leave it.
+    """
+    calls = {"n": 0}
+
+    def busy() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1  # False at the spawn gate, True at timeout
+
+    monkeypatch.setattr(macos_keychain, "_dialog_busy", busy, raising=False)
+    proc = _FakeProc(dies_on_term=False)
+    proc.stdin = _Pipe()
+    proc.stdout = _Pipe()
+    proc.stderr = _Pipe()
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert proc.signals == []
+    assert proc.stdout.closed and proc.stderr.closed and proc.stdin.closed
+    circuit = json.loads((tmp_path / "circuit.json").read_text(encoding="utf-8"))
+    assert circuit["open"] is True
+
+
+def test_timeout_without_dialog_still_sigterms_never_sigkill(monkeypatch):
+    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    proc = _FakeProc(dies_on_term=False)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert proc.signals == ["terminate"]
+
+
+def test_dialog_busy_timeout_still_surfaces_as_keychain_error(monkeypatch):
+    calls = {"n": 0}
+
+    def busy() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    monkeypatch.setattr(macos_keychain, "_dialog_busy", busy, raising=False)
+    with patch(
+        "claude_swap.macos_keychain.subprocess.Popen",
+        side_effect=lambda *a, **k: _FakeProc(dies_on_term=False),
+    ):
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.get_password("svc", "acct")
+        assert macos_keychain.item_exists("svc", "acct") is False
+

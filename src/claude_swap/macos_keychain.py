@@ -79,6 +79,14 @@ _TERM_GRACE = 2.0
 # Never write secrets here: see ``_sanitize_security_argv``.
 _LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
 
+# Sticky spawn circuit. Open on refuse/timeout/dialog; close only on spawn rc
+# 0 or 44, or :func:`reset_keychain_circuit`. Not a timer.
+_CIRCUIT_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT"
+
+# A leftover ``security`` child from a prior timeout in this process. Never
+# SIGKILL it; the next spawn refuses with ``single_flight`` while it lives.
+_left_alive: object | None = None
+
 
 def _keychain_log_path() -> Path:
     raw = os.environ.get(_LOG_ENV)
@@ -162,6 +170,124 @@ def _close_pipes(proc: subprocess.Popen[str]) -> None:
             pass
 
 
+class KeychainError(Exception):
+    """A ``security`` invocation failed for a reason other than "not found"."""
+
+
+def _circuit_path() -> Path:
+    raw = os.environ.get(_CIRCUIT_ENV)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".claude" / "state" / "keychain-watch" / "circuit.json"
+
+
+def _write_circuit(*, open_: bool, reason: str) -> None:
+    try:
+        path = _circuit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "open": open_,
+            "reason": reason,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _circuit_is_open() -> bool:
+    try:
+        data = json.loads(_circuit_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return data.get("open") is True
+
+
+def _open_circuit(reason: str) -> None:
+    _write_circuit(open_=True, reason=reason)
+
+
+def _close_circuit() -> None:
+    _write_circuit(open_=False, reason="ok")
+
+
+def reset_keychain_circuit() -> None:
+    """Close the sticky spawn circuit. Does not signal any leftover child."""
+    _close_circuit()
+
+
+def _ps_text() -> str:
+    """Process table snapshot. Never asks ``/usr/bin/security``."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout or ""
+
+
+def _dialog_busy() -> bool:
+    """True when SecurityAgent or a parked ``/usr/bin/security`` is visible."""
+    text = _ps_text()
+    for line in text.splitlines():
+        if "SecurityAgent" in line or "/usr/bin/security" in line:
+            return True
+    return False
+
+
+def _single_flight_blocked() -> bool:
+    global _left_alive
+    proc = _left_alive
+    if proc is None:
+        return False
+    poll = getattr(proc, "poll", None)
+    try:
+        rc = poll() if callable(poll) else getattr(proc, "returncode", None)
+    except Exception:
+        rc = None
+    if rc is not None:
+        _left_alive = None
+        return False
+    return True
+
+
+def _record_left_alive(proc: object) -> None:
+    global _left_alive
+    _left_alive = proc
+
+
+def _spawn_refuse_reason() -> str | None:
+    if os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1":
+        return "no_keychain_env"
+    if _circuit_is_open():
+        return "circuit_open"
+    if _dialog_busy():
+        return "dialog_busy"
+    if _single_flight_blocked():
+        return "single_flight"
+    return None
+
+
+def _refuse_spawn(argv: list[str], reason: str) -> None:
+    _open_circuit(reason)
+    _log_security_event(
+        {
+            "event": "security_spawn_refused",
+            "reason": reason,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "argv": _sanitize_security_argv([str(a) for a in argv]),
+            "cswap_argv": _caller_argv(),
+            "no_keychain": os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1",
+        }
+    )
+    raise KeychainError(f"security spawn refused ({reason})")
+
+
 def _run_security(
     argv: list[str],
     *,
@@ -174,24 +300,32 @@ def _run_security(
     :class:`subprocess.CompletedProcess` out, same :class:`subprocess.TimeoutExpired`
     on overrun, so every caller's error handling is unchanged.
 
-    The one difference is the signal, and it is the whole point.
-    ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is parked on
-    a SecurityAgent consent dialog that cannot be drawn (shielded screen, headless
-    launchd job), SIGKILL makes it vanish with an XPC query still registered;
-    ``securityd`` then destroys a still-held mutex tearing that query down, gets
-    ``EBUSY``, and the uncaught ``Security::UnixError`` aborts the daemon. Since
-    the login keychain's master key lives only in that process's memory, the
-    respawn comes up locked and every app on the machine re-prompts for the
-    keychain password. SIGTERM lets ``security`` withdraw the query first.
+    Refuses (raises :class:`KeychainError`, no Popen) when
+    ``CLAUDE_SWAP_NO_KEYCHAIN=1``, the sticky circuit is open, SecurityAgent or
+    a parked ``/usr/bin/security`` is in the process table, or a leftover child
+    from a prior timeout is still alive. That gate lives here so session.py
+    cannot bypass it.
 
-    If SIGTERM is not processed in ``_TERM_GRACE`` seconds, leave the child.
-    Escalating to SIGKILL is the crash (measured 2026-08-26 and again
-    2026-09-02): a ``security find-generic-password`` parked on the unlock
-    dialog does not handle SIGTERM until the dialog returns, so the 2s grace
-    expires and SIGKILL aborts securityd anyway.
+    The one difference on a spawned timeout is the signal, and it is the whole
+    point. ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is
+    parked on a SecurityAgent consent dialog that cannot be drawn (shielded
+    screen, headless launchd job), SIGKILL makes it vanish with an XPC query
+    still registered; ``securityd`` then destroys a still-held mutex tearing
+    that query down, gets ``EBUSY``, and the uncaught ``Security::UnixError``
+    aborts the daemon. Since the login keychain's master key lives only in that
+    process's memory, the respawn comes up locked and every app on the machine
+    re-prompts for the keychain password.
+
+    If a dialog is already up at timeout, send **no signal** — SIGTERM is not
+    processed until the dialog returns, and the old grace then SIGKILLed.
+    Otherwise SIGTERM, then leave the child. Escalating to SIGKILL is the crash
+    (measured 2026-08-26 and again 2026-09-02).
     """
     if timeout is None:
         timeout = _timeout()
+    reason = _spawn_refuse_reason()
+    if reason:
+        _refuse_spawn(argv, reason)
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if input is not None else None,
@@ -202,16 +336,33 @@ def _run_security(
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.terminate()
-        left_alive = False
+        dialog = False
         try:
-            proc.communicate(timeout=_TERM_GRACE)
-        except subprocess.TimeoutExpired:
-            # Do not SIGKILL. A child this stuck is almost certainly blocked
-            # in SecurityAgent; killing it is what aborts securityd.
+            dialog = _dialog_busy()
+        except Exception:
+            dialog = False
+        left_alive = False
+        if dialog:
+            # Do not SIGTERM/SIGKILL a child parked on SecurityAgent.
             _close_pipes(proc)
-            poll = getattr(proc, "poll", None)
-            left_alive = poll() is None if callable(poll) else proc.returncode is None
+            left_alive = True
+            _record_left_alive(proc)
+            _open_circuit("dialog_busy")
+        else:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=_TERM_GRACE)
+            except subprocess.TimeoutExpired:
+                # Do not SIGKILL. A child this stuck is almost certainly blocked
+                # in SecurityAgent; killing it is what aborts securityd.
+                _close_pipes(proc)
+                poll = getattr(proc, "poll", None)
+                left_alive = (
+                    poll() is None if callable(poll) else proc.returncode is None
+                )
+                if left_alive:
+                    _record_left_alive(proc)
+            _open_circuit("timeout")
         _log_security_event(
             {
                 "event": "security_timeout",
@@ -220,13 +371,16 @@ def _run_security(
                 "child_pid": getattr(proc, "pid", None),
                 "child_alive_after_term": left_alive,
                 "timeout_s": timeout,
-                "term_grace_s": _TERM_GRACE,
+                "term_grace_s": 0 if dialog else _TERM_GRACE,
                 "argv": _sanitize_security_argv([str(a) for a in argv]),
                 "cswap_argv": _caller_argv(),
                 "no_keychain": os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1",
+                "dialog_busy": dialog,
             }
         )
         raise
+    if proc.returncode in (0, _NOT_FOUND_RC):
+        _close_circuit()
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
@@ -283,10 +437,6 @@ def _trusted_app_paths() -> list[str]:
     if claude_path:
         paths.append(claude_path)
     return paths
-
-
-class KeychainError(Exception):
-    """A ``security`` invocation failed for a reason other than "not found"."""
 
 
 # The exceptions a Keychain operation may raise that callers should treat as
@@ -362,17 +512,18 @@ def item_exists(service: str, account: str) -> bool:
 
     Attribute-only lookup (no ``-w``): nothing is decrypted, so this can never
     trigger a Keychain prompt, even for items owned by another app. Returns
-    ``True`` only on rc 0; "not found" (rc 44), error exits, a timeout, and a
-    missing binary all return ``False``. Deliberately **non-raising**: callers use
-    it for cleanup verification, not access decisions, so it must never feed the
-    capability cache (a timeout here means "couldn't tell", not "Keychain works").
+    ``True`` only on rc 0; "not found" (rc 44), error exits, a timeout, a
+    refused spawn, and a missing binary all return ``False``. Deliberately
+    **non-raising**: callers use it for cleanup verification, not access
+    decisions, so it must never feed the capability cache (a timeout here
+    means "couldn't tell", not "Keychain works").
     """
     try:
         result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
             timeout=_timeout(),
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, KeychainError):
         return False
     return result.returncode == 0
 

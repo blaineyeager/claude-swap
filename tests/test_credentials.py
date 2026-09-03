@@ -18,9 +18,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -311,3 +313,60 @@ class TestHeadlessKeychainOptOut:
         assert store._use_keychain() is False
         monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN")
         assert store._use_keychain() is True
+
+
+@pytest.mark.no_keychain_fake
+class TestSpawnGateReachesCredentialCallers:
+    """Backup reads/retention/deletes go through ``_run_security``.
+
+    ``_read_account_credentials`` does not consult ``_use_keychain()``, so the
+    spawn gate has to live in ``macos_keychain`` or these paths keep raising
+    dialogs after the rest of the process has opted out.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _open_circuit_and_block_spawn(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "kc.jsonl"))
+        monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT", str(tmp_path / "circuit.json"))
+        monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+        (tmp_path / "circuit.json").write_text(
+            json.dumps({"open": True, "reason": "dialog_busy"}), encoding="utf-8"
+        )
+        (tmp_path / "backups").mkdir(parents=True, exist_ok=True)
+
+    def test_read_account_credentials_never_spawns(self, tmp_path):
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        with patch(
+            "claude_swap.macos_keychain.subprocess.Popen",
+            side_effect=AssertionError("must not spawn"),
+        ) as popen:
+            value = store._read_account_credentials("1", "a@example.com")
+        popen.assert_not_called()
+        assert value == ""
+
+    def test_retain_previous_backup_never_spawns(self, tmp_path):
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        with patch(
+            "claude_swap.macos_keychain.subprocess.Popen",
+            side_effect=AssertionError("must not spawn"),
+        ) as popen:
+            store._retain_previous_backup("1", "a@example.com", '{"token":"new"}')
+        popen.assert_not_called()
+
+    def test_delete_backup_keychain_quiet_never_spawns(self, tmp_path):
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        with patch(
+            "claude_swap.macos_keychain.subprocess.Popen",
+            side_effect=AssertionError("must not spawn"),
+        ) as popen:
+            store._delete_backup_keychain_quiet("1", "a@example.com")
+        popen.assert_not_called()
+
+    def test_item_exists_returns_false_without_raising(self):
+        with patch(
+            "claude_swap.macos_keychain.subprocess.Popen",
+            side_effect=AssertionError("must not spawn"),
+        ) as popen:
+            assert macos_keychain.item_exists("svc", "acct") is False
+        popen.assert_not_called()
+
