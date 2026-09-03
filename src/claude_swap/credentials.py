@@ -430,6 +430,11 @@ class CredentialStore:
         could not verify-clear. Clears any re-probe deadline a prior read
         scheduled, which could otherwise still be pending.
 
+        Exception: a *verified* clear (``residual_cleared=True``) whose file is
+        later empty may recover a Keychain item that appeared after the delete
+        — Claude Code writes rotations keychain-only, so that item is the live
+        login. See :meth:`_read_active_credentials`.
+
         ``residual_cleared`` is the caller's OBSERVATION of that delete. True:
         nothing can shadow the file, so it genuinely is the authority, and the
         two failure flags are settled — whatever failed before cannot bear on a
@@ -651,6 +656,31 @@ class CredentialStore:
                 return ActiveCredentials(None, keychain_failed, keychain_failed)
             if text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
+
+        # 2b. Write-fallback pinned us to file mode, but the file is empty.
+        # On macOS Claude Code's live login is still the Keychain item — a
+        # pin means "prefer our file when it has bytes", not "the Keychain
+        # is empty". Recovering those bytes (and unsticking routing so the
+        # next write lands where Claude Code will read) is what stops a
+        # long-running TUI from showing "no credentials" and refusing to
+        # switch. Honor NO_KEYCHAIN: a headless job must not raise a dialog.
+        if (
+            os.environ.get(NO_KEYCHAIN_ENV) != "1"
+            and self._host.platform == Platform.MACOS
+            and self._file_mode_is_ours
+            # Only a verified clear: an unverified residual may be the
+            # spent generation, and recovering it as live would POST it.
+            and self._residual_verdict is True
+        ):
+            recovered, recovered_failed = self._read_active_oauth_keychain()
+            if recovered:
+                self._keychain_usable_cache = True
+                self._keychain_disabled_until = 0.0
+                self._file_mode_is_ours = False
+                self._residual_verdict = None
+                self._active_read_failed = False
+                return ActiveCredentials(recovered, False)
+            keychain_failed = keychain_failed or recovered_failed
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
