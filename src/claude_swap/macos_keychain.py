@@ -79,8 +79,9 @@ _TERM_GRACE = 2.0
 # Never write secrets here: see ``_sanitize_security_argv``.
 _LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
 
-# Sticky spawn circuit. Open on refuse/timeout/dialog; close only on spawn rc
-# 0 or 44, or :func:`reset_keychain_circuit`. Not a timer.
+# Sticky spawn circuit. Open on dialog/timeout/single-flight refuse; close
+# only on spawn rc 0 or 44, or :func:`reset_keychain_circuit`. Not a timer.
+# ``no_keychain_env`` does not open it — that opt-out is process-local.
 _CIRCUIT_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT"
 
 # A leftover ``security`` child from a prior timeout in this process. Never
@@ -230,10 +231,19 @@ def _ps_text() -> str:
     return result.stdout or ""
 
 
-def _dialog_busy() -> bool:
-    """True when SecurityAgent or a parked ``/usr/bin/security`` is visible."""
+def _dialog_busy(exclude_pid: int | None = None) -> bool:
+    """True when SecurityAgent or a parked ``/usr/bin/security`` is visible.
+
+    ``exclude_pid`` skips that process-table row so a timeout does not treat
+    the child currently being waited on as an already-up dialog.
+    """
     text = _ps_text()
+    skip = None if exclude_pid is None else str(exclude_pid)
     for line in text.splitlines():
+        if skip is not None:
+            fields = line.split()
+            if fields and fields[0] == skip:
+                continue
         if "SecurityAgent" in line or "/usr/bin/security" in line:
             return True
     return False
@@ -273,7 +283,10 @@ def _spawn_refuse_reason() -> str | None:
 
 
 def _refuse_spawn(argv: list[str], reason: str) -> None:
-    _open_circuit(reason)
+    # Opt-out is process-env, not a durable host fault. Opening the circuit
+    # here would keep refusing after the env is gone; reset has no prod caller.
+    if reason != "no_keychain_env":
+        _open_circuit(reason)
     _log_security_event(
         {
             "event": "security_spawn_refused",
@@ -338,7 +351,7 @@ def _run_security(
     except subprocess.TimeoutExpired:
         dialog = False
         try:
-            dialog = _dialog_busy()
+            dialog = _dialog_busy(exclude_pid=proc.pid)
         except Exception:
             dialog = False
         left_alive = False

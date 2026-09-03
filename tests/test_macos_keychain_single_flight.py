@@ -28,7 +28,9 @@ def _isolate_keychain_state(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT", str(tmp_path / "circuit.json"))
     monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
     monkeypatch.setattr(macos_keychain, "_ps_text", lambda: "", raising=False)
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: False, raising=False
+    )
     if hasattr(macos_keychain, "_left_alive"):
         macos_keychain._left_alive = None
     return tmp_path
@@ -98,7 +100,7 @@ def test_dialog_timeout_records_child_for_single_flight(tmp_path, monkeypatch):
     # Gate must let the first spawn through; timeout then sees the dialog.
     calls = {"n": 0}
 
-    def busy() -> bool:
+    def busy(exclude_pid=None) -> bool:
         calls["n"] += 1
         return calls["n"] > 1
 
@@ -109,7 +111,9 @@ def test_dialog_timeout_records_child_for_single_flight(tmp_path, monkeypatch):
             macos_keychain._run_security(_FIND, timeout=0.01)
     assert leftover.signals == []  # no SIGTERM, no SIGKILL
     _close_circuit(tmp_path)
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: False, raising=False
+    )
 
     with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
         with pytest.raises(macos_keychain.KeychainError):

@@ -292,7 +292,7 @@ def test_timeout_while_dialog_busy_sends_no_signal(tmp_path, monkeypatch):
     """
     calls = {"n": 0}
 
-    def busy() -> bool:
+    def busy(exclude_pid=None) -> bool:
         calls["n"] += 1
         return calls["n"] > 1  # False at the spawn gate, True at timeout
 
@@ -313,7 +313,9 @@ def test_timeout_while_dialog_busy_sends_no_signal(tmp_path, monkeypatch):
 
 
 def test_timeout_without_dialog_still_sigterms_never_sigkill(monkeypatch):
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: False, raising=False
+    )
     proc = _FakeProc(dies_on_term=False)
     with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc):
         with pytest.raises(subprocess.TimeoutExpired):
@@ -326,7 +328,7 @@ def test_timeout_without_dialog_still_sigterms_never_sigkill(monkeypatch):
 def test_dialog_busy_timeout_still_surfaces_as_keychain_error(monkeypatch):
     calls = {"n": 0}
 
-    def busy() -> bool:
+    def busy(exclude_pid=None) -> bool:
         calls["n"] += 1
         return calls["n"] > 1
 
@@ -338,4 +340,87 @@ def test_dialog_busy_timeout_still_surfaces_as_keychain_error(monkeypatch):
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain.get_password("svc", "acct")
         assert macos_keychain.item_exists("svc", "acct") is False
+
+
+# ---------------------------------------------------------------------------
+# timeout dialog detection must ignore the child we are currently waiting on
+# ---------------------------------------------------------------------------
+
+
+_SECURITY_AGENT_PS = (
+    "  4321  1  00:12 /System/Library/Frameworks/Security.framework/"
+    "Versions/A/Resources/SecurityAgent.app/Contents/MacOS/SecurityAgent"
+)
+
+
+def _ps_flips_after_popen(proc: _FakeProc, after: str, before: str = ""):
+    """Empty (or quiet) table at the spawn gate; ``after`` once the child exists."""
+    spawned = {"yes": False}
+
+    def ps_text() -> str:
+        return after if spawned["yes"] else before
+
+    def popen(*_a, **_k):
+        spawned["yes"] = True
+        return proc
+
+    return ps_text, popen
+
+
+def test_timeout_own_security_child_is_sigtermed(monkeypatch):
+    """Our timed-out ``/usr/bin/security`` is not itself an already-up dialog.
+
+    Without excluding that pid, every real timeout sees the current child in
+    ``ps`` and takes the no-signal path, leaving a live stall forever.
+    """
+    proc = _FakeProc(dies_on_term=True)
+    proc.pid = 4242
+    ps_text, popen = _ps_flips_after_popen(
+        proc,
+        "  4242  88  00:07 /usr/bin/security find-generic-password -a acct -s svc",
+    )
+    monkeypatch.setattr(macos_keychain, "_ps_text", ps_text, raising=False)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=popen):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert "terminate" in proc.signals
+    assert "kill" not in proc.signals
+
+
+def test_timeout_with_security_agent_sends_no_signal(monkeypatch):
+    proc = _FakeProc(dies_on_term=False)
+    proc.pid = 4242
+    ps_text, popen = _ps_flips_after_popen(
+        proc,
+        "  4242  88  00:07 /usr/bin/security find-generic-password -a acct -s svc\n"
+        + _SECURITY_AGENT_PS,
+    )
+    monkeypatch.setattr(macos_keychain, "_ps_text", ps_text, raising=False)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=popen):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert proc.signals == []
+    assert "kill" not in proc.signals
+
+
+def test_timeout_with_other_parked_security_sends_no_signal(monkeypatch):
+    proc = _FakeProc(dies_on_term=False)
+    proc.pid = 4242
+    ps_text, popen = _ps_flips_after_popen(
+        proc,
+        "  4242  88  00:07 /usr/bin/security find-generic-password -a acct -s svc\n"
+        "  9999  1  00:07 /usr/bin/security find-generic-password -a other -s svc",
+    )
+    monkeypatch.setattr(macos_keychain, "_ps_text", ps_text, raising=False)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=popen):
+        with pytest.raises(subprocess.TimeoutExpired):
+            macos_keychain._run_security(
+                [macos_keychain._SECURITY, "find-generic-password"], timeout=0.01
+            )
+    assert proc.signals == []
+    assert "kill" not in proc.signals
 

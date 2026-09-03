@@ -108,6 +108,29 @@ def test_no_keychain_env_refuses_without_popen(tmp_path, monkeypatch):
     assert rows[-1]["reason"] == "no_keychain_env"
 
 
+def test_no_keychain_env_refuse_does_not_open_sticky_circuit(tmp_path, monkeypatch):
+    """CLAUDE_SWAP_NO_KEYCHAIN=1 is a process opt-out, not a durable host fault.
+
+    Opening circuit.json here would keep refusing after the env is gone;
+    reset_keychain_circuit() has no production caller.
+    """
+    monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain._run_security(_FIND)
+    popen.assert_not_called()
+    circuit = _circuit(tmp_path)
+    assert circuit is None or circuit.get("open") is not True
+
+    monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+    monkeypatch.setattr(macos_keychain, "_ps_text", lambda: "", raising=False)
+    proc = _DoneProc(0)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc) as popen:
+        result = macos_keychain._run_security(_FIND)
+    popen.assert_called_once()
+    assert result.returncode == 0
+
+
 def test_session_delete_cannot_bypass_no_keychain_env(tmp_path, monkeypatch):
     """session.py never checked the env; the gate in this module must cover it."""
     monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
@@ -141,7 +164,9 @@ def test_open_circuit_refuses_without_popen(tmp_path):
 
 def test_circuit_does_not_auto_close_when_security_agent_is_gone(tmp_path, monkeypatch):
     _write_circuit(tmp_path, open_=True, reason="dialog_busy")
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: False, raising=False
+    )
     monkeypatch.setattr(macos_keychain, "_ps_text", lambda: "", raising=False)
     with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
         with pytest.raises(macos_keychain.KeychainError):
@@ -201,7 +226,9 @@ def test_other_rc_does_not_close_or_open_circuit(tmp_path):
 
 
 def test_timeout_opens_circuit(tmp_path, monkeypatch):
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: False, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: False, raising=False
+    )
 
     class _Hang:
         def __init__(self):
@@ -274,7 +301,9 @@ def test_parked_security_in_ps_refuses_without_popen(tmp_path, monkeypatch):
 
 
 def test_dialog_busy_override_refuses_without_popen(tmp_path, monkeypatch):
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: True, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: True, raising=False
+    )
     with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain._run_security(_FIND)
@@ -307,7 +336,9 @@ def test_ps_text_invokes_ps_not_security():
 def test_refuse_reason_prefers_no_keychain_env(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
     _write_circuit(tmp_path, open_=True)
-    monkeypatch.setattr(macos_keychain, "_dialog_busy", lambda: True, raising=False)
+    monkeypatch.setattr(
+        macos_keychain, "_dialog_busy", lambda exclude_pid=None: True, raising=False
+    )
     with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn):
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain._run_security(_FIND)
