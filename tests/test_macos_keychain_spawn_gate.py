@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ def _isolate_keychain_state(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "kc.jsonl"))
     monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT", str(tmp_path / "circuit.json"))
     monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+    monkeypatch.delenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", raising=False)
     monkeypatch.setattr(macos_keychain, "_ps_text", lambda: "", raising=False)
     if hasattr(macos_keychain, "_left_alive"):
         macos_keychain._left_alive = None
@@ -80,9 +82,18 @@ def _circuit(tmp_path: Path) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_circuit(tmp_path: Path, *, open_: bool, reason: str = "dialog_busy") -> None:
+def _write_circuit(
+    tmp_path: Path,
+    *,
+    open_: bool,
+    reason: str = "dialog_busy",
+    ts: str | None = None,
+) -> None:
+    """Write a circuit file. ``ts`` defaults to now so an open circuit is fresh."""
+    if ts is None:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (tmp_path / "circuit.json").write_text(
-        json.dumps({"open": open_, "reason": reason}),
+        json.dumps({"open": open_, "reason": reason, "ts": ts}),
         encoding="utf-8",
     )
 
@@ -111,8 +122,8 @@ def test_no_keychain_env_refuses_without_popen(tmp_path, monkeypatch):
 def test_no_keychain_env_refuse_does_not_open_sticky_circuit(tmp_path, monkeypatch):
     """CLAUDE_SWAP_NO_KEYCHAIN=1 is a process opt-out, not a durable host fault.
 
-    Opening circuit.json here would keep refusing after the env is gone;
-    reset_keychain_circuit() has no production caller.
+    Opening circuit.json here would keep refusing after the env is gone,
+    until the TTL or ``cswap keychain-circuit reset``.
     """
     monkeypatch.setenv("CLAUDE_SWAP_NO_KEYCHAIN", "1")
     with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
@@ -148,7 +159,7 @@ def test_only_explicit_1_is_no_keychain_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# sticky circuit
+# spawn circuit
 # ---------------------------------------------------------------------------
 
 
@@ -175,13 +186,106 @@ def test_circuit_does_not_auto_close_when_security_agent_is_gone(tmp_path, monke
     assert _circuit(tmp_path)["open"] is True
 
 
-def test_circuit_does_not_auto_close_on_a_timer(tmp_path, monkeypatch):
-    _write_circuit(tmp_path, open_=True, reason="timeout")
-    monkeypatch.setattr("time.monotonic", lambda: 10**12)
-    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn):
+def test_fresh_circuit_still_refuses_and_stays_open(tmp_path):
+    """A circuit opened just now (inside the TTL) still refuses and stays open."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _write_circuit(tmp_path, open_=True, reason="timeout", ts=ts)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
         with pytest.raises(macos_keychain.KeychainError):
             macos_keychain._run_security(_FIND)
+    popen.assert_not_called()
     assert _circuit(tmp_path)["open"] is True
+
+
+def test_expired_circuit_is_closed_and_allows_spawn(tmp_path, monkeypatch):
+    """An open circuit older than the TTL is persisted closed and spawn proceeds."""
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", "60")
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 60 * 60))
+    _write_circuit(tmp_path, open_=True, reason="timeout", ts=old)
+
+    # The gate itself persists the close; rc 0 would also close afterwards.
+    assert macos_keychain._circuit_is_open() is False
+    closed = _circuit(tmp_path)
+    assert closed is not None
+    assert closed["open"] is False
+    assert closed["reason"] == "expired"
+
+    proc = _DoneProc(0)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc) as popen:
+        result = macos_keychain._run_security(_FIND)
+    popen.assert_called_once()
+    assert result.returncode == 0
+    assert _circuit(tmp_path)["open"] is False
+
+
+def test_circuit_ttl_env_override_honored(tmp_path, monkeypatch):
+    """``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL`` changes the deadline; bad values do not."""
+    assert macos_keychain._circuit_ttl() == macos_keychain._CIRCUIT_TTL_DEFAULT
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", "60")
+    assert macos_keychain._circuit_ttl() == 60.0
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", "90.5")
+    assert macos_keychain._circuit_ttl() == 90.5
+    for bad in ("", "nope", "-1", "-0.1", "nan", "inf"):
+        monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", bad)
+        assert macos_keychain._circuit_ttl() == macos_keychain._CIRCUIT_TTL_DEFAULT
+
+    # Two hours old would expire at the 300s default. A long override keeps it.
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", "86400")
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 60 * 60))
+    _write_circuit(tmp_path, open_=True, reason="timeout", ts=old)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", side_effect=_must_not_spawn) as popen:
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain._run_security(_FIND)
+    popen.assert_not_called()
+    assert _circuit(tmp_path)["open"] is True
+
+    # The same age expires when the override is shorter than it.
+    monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", "60")
+    _write_circuit(tmp_path, open_=True, reason="timeout", ts=old)
+    proc = _DoneProc(0)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc) as popen:
+        result = macos_keychain._run_security(_FIND)
+    popen.assert_called_once()
+    assert result.returncode == 0
+    assert _circuit(tmp_path)["open"] is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"open": True, "reason": "dialog_busy"},
+        {"open": True, "reason": "dialog_busy", "ts": "not-a-timestamp"},
+        {"open": True, "reason": "dialog_busy", "ts": ""},
+    ],
+    ids=["missing-ts", "unparseable-ts", "empty-ts"],
+)
+def test_circuit_missing_or_bad_ts_is_treated_closed(tmp_path, payload):
+    """A corrupt timestamp must not wedge spawns; the circuit is persisted closed."""
+    (tmp_path / "circuit.json").write_text(json.dumps(payload), encoding="utf-8")
+    assert macos_keychain._circuit_is_open() is False
+    closed = _circuit(tmp_path)
+    assert closed is not None and closed["open"] is False
+    assert closed["reason"] == "expired"
+
+    proc = _DoneProc(0)
+    with patch("claude_swap.macos_keychain.subprocess.Popen", return_value=proc) as popen:
+        result = macos_keychain._run_security(_FIND)
+    popen.assert_called_once()
+    assert result.returncode == 0
+    assert _circuit(tmp_path)["open"] is False
+
+
+def test_keychain_circuit_reset_command_closes_and_prints(tmp_path, capsys):
+    import sys
+
+    from claude_swap import cli
+
+    _write_circuit(tmp_path, open_=True, reason="dialog_busy")
+    assert _circuit(tmp_path)["open"] is True
+    with patch.object(sys, "argv", ["cswap", "keychain-circuit", "reset"]):
+        cli.main()
+    assert "Keychain spawn circuit reset (closed)" in capsys.readouterr().out
+    assert _circuit(tmp_path)["open"] is False
 
 
 def test_explicit_reset_closes_circuit_and_allows_spawn(tmp_path):

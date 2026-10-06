@@ -388,6 +388,33 @@ def _unclaimed_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _keychain_circuit_command(argv: list[str]) -> None:
+    """Handle `cswap keychain-circuit reset` — close the Keychain spawn circuit.
+
+    An open circuit refuses ``security`` spawns after a dialog, a timeout, or
+    a single-flight collision. It also closes on a successful spawn (rc 0/44)
+    and on its own after a TTL; this is the operator path that does not wait.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} keychain-circuit",
+        description=(
+            "Reset the macOS Keychain spawn circuit so the next security(1) "
+            "spawn is allowed. The circuit also closes on its own after a TTL."
+        ),
+    )
+    parser.add_argument(
+        "action",
+        choices=["reset"],
+        help="Close the spawn circuit",
+    )
+    args = parser.parse_args(argv)
+    if args.action == "reset":
+        from claude_swap import macos_keychain
+
+        macos_keychain.reset_keychain_circuit()
+        print("Keychain spawn circuit reset (closed)")
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -941,6 +968,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "keychain-circuit":
+        _keychain_circuit_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -988,6 +1018,7 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
+  %(prog)s keychain-circuit reset     close the macOS Keychain spawn circuit
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)

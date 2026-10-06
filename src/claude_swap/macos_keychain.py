@@ -35,6 +35,7 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import calendar
 import json
 import math
 import os
@@ -79,10 +80,16 @@ _TERM_GRACE = 2.0
 # Never write secrets here: see ``_sanitize_security_argv``.
 _LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
 
-# Sticky spawn circuit. Open on dialog/timeout/single-flight refuse; close
-# only on spawn rc 0 or 44, or :func:`reset_keychain_circuit`. Not a timer.
+# Spawn circuit. Open on dialog/timeout/single-flight refuse; close on spawn
+# rc 0 or 44, :func:`reset_keychain_circuit` / ``cswap keychain-circuit reset``,
+# or after a TTL (default 300s, override ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL``).
 # ``no_keychain_env`` does not open it — that opt-out is process-local.
 _CIRCUIT_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT"
+_CIRCUIT_TTL_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL"
+_CIRCUIT_TTL_DEFAULT = 300.0  # seconds
+# Absolute UTC, shared across processes. Monotonic clocks are not comparable
+# between processes and cannot be stored in this file.
+_CIRCUIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # A leftover ``security`` child from a prior timeout in this process. Never
 # SIGKILL it; the next spawn refuses with ``single_flight`` while it lives.
@@ -189,11 +196,40 @@ def _write_circuit(*, open_: bool, reason: str) -> None:
         payload = {
             "open": open_,
             "reason": reason,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": time.strftime(_CIRCUIT_TS_FORMAT, time.gmtime()),
         }
         path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         return
+
+
+def _circuit_ttl() -> float:
+    """Seconds an open circuit stays open.
+
+    ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL`` overrides :data:`_CIRCUIT_TTL_DEFAULT`.
+    Missing, non-numeric, non-finite, or negative values fall back to the
+    default so a bad setting cannot disable the breaker or pin it open.
+    """
+    raw = os.environ.get(_CIRCUIT_TTL_ENV)
+    if raw is None or raw.strip() == "":
+        return _CIRCUIT_TTL_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _CIRCUIT_TTL_DEFAULT
+    if not math.isfinite(value) or value < 0:
+        return _CIRCUIT_TTL_DEFAULT
+    return value
+
+
+def _circuit_ts_epoch(raw: object) -> float | None:
+    """Parse a circuit ``ts`` as a UTC epoch, or None if it is unusable."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(raw, _CIRCUIT_TS_FORMAT)))
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def _circuit_is_open() -> bool:
@@ -201,19 +237,32 @@ def _circuit_is_open() -> bool:
         data = json.loads(_circuit_path().read_text(encoding="utf-8"))
     except Exception:
         return False
-    return data.get("open") is True
+    if not isinstance(data, dict) or data.get("open") is not True:
+        return False
+    opened = _circuit_ts_epoch(data.get("ts"))
+    # time.time() (wall clock), not monotonic: ``ts`` is absolute UTC shared
+    # across processes. Missing or unparseable stamps count as expired so a
+    # corrupt file cannot wedge spawns forever.
+    if opened is None or (time.time() - opened) >= _circuit_ttl():
+        _close_circuit("expired")
+        return False
+    return True
 
 
 def _open_circuit(reason: str) -> None:
     _write_circuit(open_=True, reason=reason)
 
 
-def _close_circuit() -> None:
-    _write_circuit(open_=False, reason="ok")
+def _close_circuit(reason: str = "ok") -> None:
+    _write_circuit(open_=False, reason=reason)
 
 
 def reset_keychain_circuit() -> None:
-    """Close the sticky spawn circuit. Does not signal any leftover child."""
+    """Close the spawn circuit. Does not signal any leftover child.
+
+    Same effect as ``cswap keychain-circuit reset``. An open circuit also
+    closes on its own after :func:`_circuit_ttl` (default 300s).
+    """
     _close_circuit()
 
 
@@ -284,7 +333,7 @@ def _spawn_refuse_reason() -> str | None:
 
 def _refuse_spawn(argv: list[str], reason: str) -> None:
     # Opt-out is process-env, not a durable host fault. Opening the circuit
-    # here would keep refusing after the env is gone; reset has no prod caller.
+    # here would keep refusing after the env is gone (until the TTL or a reset).
     if reason != "no_keychain_env":
         _open_circuit(reason)
     _log_security_event(
@@ -314,10 +363,10 @@ def _run_security(
     on overrun, so every caller's error handling is unchanged.
 
     Refuses (raises :class:`KeychainError`, no Popen) when
-    ``CLAUDE_SWAP_NO_KEYCHAIN=1``, the sticky circuit is open, SecurityAgent or
-    a parked ``/usr/bin/security`` is in the process table, or a leftover child
-    from a prior timeout is still alive. That gate lives here so session.py
-    cannot bypass it.
+    ``CLAUDE_SWAP_NO_KEYCHAIN=1``, the spawn circuit is open and still inside
+    its TTL, SecurityAgent or a parked ``/usr/bin/security`` is in the process
+    table, or a leftover child from a prior timeout is still alive. That gate
+    lives here so session.py cannot bypass it.
 
     The one difference on a spawned timeout is the signal, and it is the whole
     point. ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is

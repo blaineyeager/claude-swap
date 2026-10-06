@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -329,8 +330,12 @@ class TestSpawnGateReachesCredentialCallers:
         monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_LOG", str(tmp_path / "kc.jsonl"))
         monkeypatch.setenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT", str(tmp_path / "circuit.json"))
         monkeypatch.delenv("CLAUDE_SWAP_NO_KEYCHAIN", raising=False)
+        monkeypatch.delenv("CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL", raising=False)
+        # A missing ts is treated as expired; this fixture is a fresh open circuit.
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         (tmp_path / "circuit.json").write_text(
-            json.dumps({"open": True, "reason": "dialog_busy"}), encoding="utf-8"
+            json.dumps({"open": True, "reason": "dialog_busy", "ts": ts}),
+            encoding="utf-8",
         )
         (tmp_path / "backups").mkdir(parents=True, exist_ok=True)
 
