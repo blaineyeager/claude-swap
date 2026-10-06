@@ -35,10 +35,16 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import calendar
+import json
 import math
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
@@ -67,9 +73,93 @@ _SECURITY = "/usr/bin/security"
 # meaning "no deadline" (a hang) or "kill instantly".
 _TIMEOUT_ENV = "CLAUDE_SWAP_KEYCHAIN_TIMEOUT"
 
-# How long a timed-out ``security`` gets to unwind after SIGTERM before SIGKILL.
-# It only has to withdraw its SecurityAgent query, so this is generous.
+# How long a timed-out ``security`` gets to unwind after SIGTERM. If it is
+# still alive after this, we leave it — SIGKILL is what aborts securityd.
 _TERM_GRACE = 2.0
+
+# JSONL breadcrumb for the next keychain-dialog incident. Override in tests.
+# Never write secrets here: see ``_sanitize_security_argv``.
+_LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
+
+# Spawn circuit. Open on dialog/timeout/single-flight refuse; close on spawn
+# rc 0 or 44, :func:`reset_keychain_circuit` / ``cswap keychain-circuit reset``,
+# or after a TTL (default 300s, override ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL``,
+# capped at :data:`_CIRCUIT_TTL_MAX`). A refuse because the circuit is already
+# open does not rewrite the file — refreshing ``ts`` would restart the TTL and
+# a poller would never recover. ``no_keychain_env`` does not open it — that
+# opt-out is process-local. A ``ts`` further than :data:`_CIRCUIT_FUTURE_SKEW`
+# ahead of the wall clock is treated as expired (the clock stepped back).
+_CIRCUIT_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT"
+_CIRCUIT_TTL_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL"
+_CIRCUIT_TTL_DEFAULT = 300.0  # seconds
+_CIRCUIT_TTL_MAX = 3600.0  # seconds; larger overrides are clamped
+# How far a ``ts`` may sit in the future before it is treated as a clock jump
+# rather than a fresh open. A few seconds of writer/reader skew is normal.
+_CIRCUIT_FUTURE_SKEW = 60.0  # seconds
+# Absolute UTC, shared across processes. Monotonic clocks are not comparable
+# between processes and cannot be stored in this file.
+_CIRCUIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# A leftover ``security`` child from a prior timeout in this process. Never
+# SIGKILL it; the next spawn refuses with ``single_flight`` while it lives.
+_left_alive: object | None = None
+
+
+def _keychain_log_path() -> Path:
+    raw = os.environ.get(_LOG_ENV)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".claude" / "state" / "keychain-watch" / "cswap-keychain.jsonl"
+
+
+def _sanitize_security_argv(argv: list[str]) -> list[str]:
+    """Drop hex payloads (``-X``) so a timeout log cannot leak a credential."""
+    out: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+            continue
+        if arg == "-X":
+            out.append(arg)
+            redact_next = True
+            continue
+        if arg.startswith("-X") and arg != "-X":
+            out.append("-X<redacted>")
+            continue
+        if arg == "-p":
+            out.append(arg)
+            redact_next = True
+            continue
+        out.append(arg)
+    return out
+
+
+def _caller_argv() -> list[str]:
+    """cswap's own argv, truncated and stripped of anything that looks like a token."""
+    out: list[str] = []
+    for arg in sys.argv[:6]:
+        if arg.startswith("sk-ant") or len(arg) > 80:
+            out.append("<redacted>")
+        else:
+            out.append(arg)
+    return out
+
+
+def _log_security_event(payload: dict) -> None:
+    """Append one JSON line. Must never raise — logging is best-effort."""
+    try:
+        path = _keychain_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **payload,
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        return
 
 
 def _timeout() -> float:
@@ -86,30 +176,271 @@ def _timeout() -> float:
     return value
 
 
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Drop our ends of a leftover child's pipes so *this* process does not leak FDs."""
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+class KeychainError(Exception):
+    """A ``security`` invocation failed for a reason other than "not found"."""
+
+
+def _circuit_path() -> Path:
+    raw = os.environ.get(_CIRCUIT_ENV)
+    if raw:
+        return Path(raw)
+    return Path.home() / ".claude" / "state" / "keychain-watch" / "circuit.json"
+
+
+def _write_circuit(*, open_: bool, reason: str) -> bool:
+    """Persist the circuit flag. True when the file was replaced.
+
+    The write is atomic: a temp file in the same directory, then
+    ``os.replace``, so a reader never observes a partial JSON document. The
+    temp file is removed if the replace does not finish. Best-effort: any
+    failure returns False and leaves the previous file, if any, unchanged.
+    """
+    fd = -1
+    tmp_name: str | None = None
+    try:
+        path = _circuit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "open": open_,
+            "reason": reason,
+            "ts": time.strftime(_CIRCUIT_TS_FORMAT, time.gmtime()),
+        }
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        os.write(fd, json.dumps(payload).encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, path)
+        return True
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        return False
+
+
+def _circuit_ttl() -> float:
+    """Seconds an open circuit stays open.
+
+    ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL`` overrides :data:`_CIRCUIT_TTL_DEFAULT`.
+    Anything that is not a finite positive number — missing, non-numeric,
+    non-finite (``nan`` / ``inf``), zero (``"0"``, ``"0.0"``, ``"-0"``), or
+    negative — falls back to the default. Zero would expire every open
+    circuit immediately and disable the breaker; a non-finite value cannot
+    be compared. Values above :data:`_CIRCUIT_TTL_MAX` are clamped so a huge
+    override cannot pin the breaker open for a day.
+    """
+    raw = os.environ.get(_CIRCUIT_TTL_ENV)
+    if raw is None or raw.strip() == "":
+        return _CIRCUIT_TTL_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _CIRCUIT_TTL_DEFAULT
+    if not math.isfinite(value) or value <= 0:
+        return _CIRCUIT_TTL_DEFAULT
+    if value > _CIRCUIT_TTL_MAX:
+        return _CIRCUIT_TTL_MAX
+    return value
+
+
+def _circuit_ts_epoch(raw: object) -> float | None:
+    """Parse a circuit ``ts`` as a UTC epoch, or None if it is unusable."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(raw, _CIRCUIT_TS_FORMAT)))
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _circuit_is_open() -> bool:
+    try:
+        data = json.loads(_circuit_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or data.get("open") is not True:
+        return False
+    opened = _circuit_ts_epoch(data.get("ts"))
+    # time.time() (wall clock), not monotonic: ``ts`` is absolute UTC shared
+    # across processes. Missing or unparseable stamps count as expired so a
+    # corrupt file cannot wedge spawns forever. A stamp more than
+    # ``_CIRCUIT_FUTURE_SKEW`` ahead of now is also expired — the clock jumped
+    # backward, and waiting for wall time to catch the stamp would pin the
+    # breaker open. ``age == TTL`` is expired (the window is half-open).
+    if opened is None:
+        _close_circuit("expired")
+        return False
+    age = time.time() - opened
+    if age >= _circuit_ttl() or age < -_CIRCUIT_FUTURE_SKEW:
+        _close_circuit("expired")
+        return False
+    return True
+
+
+def _open_circuit(reason: str) -> bool:
+    return _write_circuit(open_=True, reason=reason)
+
+
+def _close_circuit(reason: str = "ok") -> bool:
+    return _write_circuit(open_=False, reason=reason)
+
+
+def reset_keychain_circuit() -> bool:
+    """Close the spawn circuit. Does not signal any leftover child.
+
+    Same effect as ``cswap keychain-circuit reset``. An open circuit also
+    closes on its own after :func:`_circuit_ttl` (default 300s, never above
+    :data:`_CIRCUIT_TTL_MAX`).
+
+    Returns True when the closed state was written. Returns False when the
+    write failed; the previous file, if any, is left unchanged.
+    """
+    return _close_circuit()
+
+
+def _ps_text() -> str:
+    """Process table snapshot. Never asks ``/usr/bin/security``."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout or ""
+
+
+def _dialog_busy(exclude_pid: int | None = None) -> bool:
+    """True when SecurityAgent or a parked ``/usr/bin/security`` is visible.
+
+    ``exclude_pid`` skips that process-table row so a timeout does not treat
+    the child currently being waited on as an already-up dialog.
+    """
+    text = _ps_text()
+    skip = None if exclude_pid is None else str(exclude_pid)
+    for line in text.splitlines():
+        if skip is not None:
+            fields = line.split()
+            if fields and fields[0] == skip:
+                continue
+        if "SecurityAgent" in line or "/usr/bin/security" in line:
+            return True
+    return False
+
+
+def _single_flight_blocked() -> bool:
+    global _left_alive
+    proc = _left_alive
+    if proc is None:
+        return False
+    poll = getattr(proc, "poll", None)
+    try:
+        rc = poll() if callable(poll) else getattr(proc, "returncode", None)
+    except Exception:
+        rc = None
+    if rc is not None:
+        _left_alive = None
+        return False
+    return True
+
+
+def _record_left_alive(proc: object) -> None:
+    global _left_alive
+    _left_alive = proc
+
+
+def _spawn_refuse_reason() -> str | None:
+    if os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1":
+        return "no_keychain_env"
+    if _circuit_is_open():
+        return "circuit_open"
+    if _dialog_busy():
+        return "dialog_busy"
+    if _single_flight_blocked():
+        return "single_flight"
+    return None
+
+
+def _refuse_spawn(argv: list[str], reason: str) -> None:
+    # Opt-out is process-env, not a durable host fault. Opening the circuit
+    # here would keep refusing after the env is gone (until the TTL or a reset).
+    # An already-open circuit must not be rewritten either: ``_open_circuit``
+    # stamps ``ts`` as now, which restarts the TTL, so a once-a-minute poller
+    # never reaches expiry.
+    if reason not in ("no_keychain_env", "circuit_open"):
+        _open_circuit(reason)
+    _log_security_event(
+        {
+            "event": "security_spawn_refused",
+            "reason": reason,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "argv": _sanitize_security_argv([str(a) for a in argv]),
+            "cswap_argv": _caller_argv(),
+            "no_keychain": os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1",
+        }
+    )
+    raise KeychainError(f"security spawn refused ({reason})")
+
+
 def _run_security(
     argv: list[str],
     *,
     input: str | None = None,  # noqa: A002 - mirrors subprocess.run's name
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Spawn ``security``, escalating SIGTERM -> SIGKILL if it overruns.
+    """Spawn ``security``, sending SIGTERM on overrun — never SIGKILL.
 
     Drop-in for ``subprocess.run(..., capture_output=True, text=True)``: same
     :class:`subprocess.CompletedProcess` out, same :class:`subprocess.TimeoutExpired`
     on overrun, so every caller's error handling is unchanged.
 
-    The one difference is the signal, and it is the whole point.
-    ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is parked on
-    a SecurityAgent consent dialog that cannot be drawn (shielded screen, headless
-    launchd job), SIGKILL makes it vanish with an XPC query still registered;
-    ``securityd`` then destroys a still-held mutex tearing that query down, gets
-    ``EBUSY``, and the uncaught ``Security::UnixError`` aborts the daemon. Since
-    the login keychain's master key lives only in that process's memory, the
-    respawn comes up locked and every app on the machine re-prompts for the
-    keychain password. SIGTERM lets ``security`` withdraw the query first.
+    Refuses (raises :class:`KeychainError`, no Popen) when
+    ``CLAUDE_SWAP_NO_KEYCHAIN=1``, the spawn circuit is open and still inside
+    its TTL, SecurityAgent or a parked ``/usr/bin/security`` is in the process
+    table, or a leftover child from a prior timeout is still alive. That gate
+    lives here so session.py cannot bypass it.
+
+    The one difference on a spawned timeout is the signal, and it is the whole
+    point. ``subprocess.run(timeout=...)`` sends **SIGKILL**. When the child is
+    parked on a SecurityAgent consent dialog that cannot be drawn (shielded
+    screen, headless launchd job), SIGKILL makes it vanish with an XPC query
+    still registered; ``securityd`` then destroys a still-held mutex tearing
+    that query down, gets ``EBUSY``, and the uncaught ``Security::UnixError``
+    aborts the daemon. Since the login keychain's master key lives only in that
+    process's memory, the respawn comes up locked and every app on the machine
+    re-prompts for the keychain password.
+
+    If a dialog is already up at timeout, send **no signal** — SIGTERM is not
+    processed until the dialog returns, and the old grace then SIGKILLed.
+    Otherwise SIGTERM, then leave the child. Escalating to SIGKILL is the crash
+    (measured 2026-08-26 and again 2026-09-02).
     """
     if timeout is None:
         timeout = _timeout()
+    reason = _spawn_refuse_reason()
+    if reason:
+        _refuse_spawn(argv, reason)
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if input is not None else None,
@@ -120,15 +451,51 @@ def _run_security(
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.terminate()
+        dialog = False
         try:
-            proc.communicate(timeout=_TERM_GRACE)
-        except subprocess.TimeoutExpired:
-            # Wedged past SIGTERM. Now SIGKILL is the only option left, and a
-            # child this stuck was never going to unwind cleanly anyway.
-            proc.kill()
-            proc.communicate()
+            dialog = _dialog_busy(exclude_pid=proc.pid)
+        except Exception:
+            dialog = False
+        left_alive = False
+        if dialog:
+            # Do not SIGTERM/SIGKILL a child parked on SecurityAgent.
+            _close_pipes(proc)
+            left_alive = True
+            _record_left_alive(proc)
+            _open_circuit("dialog_busy")
+        else:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=_TERM_GRACE)
+            except subprocess.TimeoutExpired:
+                # Do not SIGKILL. A child this stuck is almost certainly blocked
+                # in SecurityAgent; killing it is what aborts securityd.
+                _close_pipes(proc)
+                poll = getattr(proc, "poll", None)
+                left_alive = (
+                    poll() is None if callable(poll) else proc.returncode is None
+                )
+                if left_alive:
+                    _record_left_alive(proc)
+            _open_circuit("timeout")
+        _log_security_event(
+            {
+                "event": "security_timeout",
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "child_pid": getattr(proc, "pid", None),
+                "child_alive_after_term": left_alive,
+                "timeout_s": timeout,
+                "term_grace_s": 0 if dialog else _TERM_GRACE,
+                "argv": _sanitize_security_argv([str(a) for a in argv]),
+                "cswap_argv": _caller_argv(),
+                "no_keychain": os.environ.get("CLAUDE_SWAP_NO_KEYCHAIN") == "1",
+                "dialog_busy": dialog,
+            }
+        )
         raise
+    if proc.returncode in (0, _NOT_FOUND_RC):
+        _close_circuit()
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
@@ -185,10 +552,6 @@ def _trusted_app_paths() -> list[str]:
     if claude_path:
         paths.append(claude_path)
     return paths
-
-
-class KeychainError(Exception):
-    """A ``security`` invocation failed for a reason other than "not found"."""
 
 
 # The exceptions a Keychain operation may raise that callers should treat as
@@ -264,17 +627,18 @@ def item_exists(service: str, account: str) -> bool:
 
     Attribute-only lookup (no ``-w``): nothing is decrypted, so this can never
     trigger a Keychain prompt, even for items owned by another app. Returns
-    ``True`` only on rc 0; "not found" (rc 44), error exits, a timeout, and a
-    missing binary all return ``False``. Deliberately **non-raising**: callers use
-    it for cleanup verification, not access decisions, so it must never feed the
-    capability cache (a timeout here means "couldn't tell", not "Keychain works").
+    ``True`` only on rc 0; "not found" (rc 44), error exits, a timeout, a
+    refused spawn, and a missing binary all return ``False``. Deliberately
+    **non-raising**: callers use it for cleanup verification, not access
+    decisions, so it must never feed the capability cache (a timeout here
+    means "couldn't tell", not "Keychain works").
     """
     try:
         result = _run_security(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
             timeout=_timeout(),
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, KeychainError):
         return False
     return result.returncode == 0
 
