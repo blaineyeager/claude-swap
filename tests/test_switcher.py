@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1301,6 +1302,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1361,6 +1363,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
@@ -1424,6 +1427,7 @@ class TestListAccountsUsage:
 
         with patch.object(switcher, "_read_credentials", return_value=active_creds), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup, \
              patch.object(switcher, "consume_backup_grant", side_effect=mock_gate), \
@@ -1596,6 +1600,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             switcher.list_accounts()
 
@@ -1637,6 +1642,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1667,6 +1673,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)):
             switcher.list_accounts()
@@ -1712,6 +1719,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts()
@@ -1758,6 +1766,8 @@ class TestListAccountsUsage:
             return_value=ActiveCredentials(active_creds, False),
         ), patch.object(
             switcher, "_read_account_credentials", return_value=backup_creds
+        ), patch.object(
+            switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)
         ), patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
             return_value=oauth.UsageOutcome(refreshed),
@@ -1859,6 +1869,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch=set())
@@ -1868,6 +1879,7 @@ class TestListAccountsUsage:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
             switcher.list_accounts(fetch={"2"})
@@ -9461,11 +9473,12 @@ class TestBackupUnreadableDisplay:
 
 
 class TestBuildAccountsInfoRetriesEmptyBackupRead:
-    """Inactive-slot backup reads that come back "" are retried once.
+    """Inactive-slot backup reads that failed are retried once.
 
     ``_read_account_credentials`` swallows a transient Keychain failure to
-    "". Without a retry at ``_build_accounts_info``, that empty string is
-    what every consumer sees for the rest of the pass.
+    "". ``_read_account_credentials_ex`` reports that as ``("", True)``.
+    ``_build_accounts_info`` retries that case once. A genuinely absent
+    backup (``("", False)`` — no .enc, keychain said not-found) is not.
     """
 
     def _switcher(self, sample_sequence_data: dict) -> ClaudeAccountSwitcher:
@@ -9477,14 +9490,18 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
         return s
 
     @staticmethod
-    def _scripted(by_num: dict[str, list[str]]):
-        """Per-slot reader: successive scripted values, then the last one."""
+    def _scripted(by_num: dict[str, list[tuple[str, bool]]]):
+        """Per-slot reader: successive (value, unreadable) pairs, then the last."""
         counts: dict[str, int] = {}
 
-        def side_effect(account_num: str, email: str) -> str:
+        def side_effect(account_num: str, email: str) -> tuple[str, bool]:
+            # list_accounts re-reads the active slot's backup from this seam
+            # (_entry_token_dead). Slots the test didn't script are absent.
+            seq = by_num.get(str(account_num))
+            if seq is None:
+                return "", False
             n = counts.get(account_num, 0)
             counts[account_num] = n + 1
-            seq = by_num[str(account_num)]
             return seq[n] if n < len(seq) else seq[-1]
 
         return counts, side_effect
@@ -9495,7 +9512,7 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
             s, "_read_active_credentials",
             return_value=ActiveCredentials(active, False),
         ), patch.object(
-            s, "_read_account_credentials", side_effect=side_effect,
+            s, "_read_account_credentials_ex", side_effect=side_effect,
         ):
             return s._build_accounts_info()
 
@@ -9507,7 +9524,7 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
             "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
         })
         s = self._switcher(sample_sequence_data)
-        counts, side_effect = self._scripted({"2": ["", real]})
+        counts, side_effect = self._scripted({"2": [("", True), (real, False)]})
         rows = {row[0]: row for row in self._rows(s, side_effect)}
         assert rows[2][4] is False
         assert rows[2][5] == real
@@ -9521,13 +9538,13 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
             "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
         })
         s = self._switcher(sample_sequence_data)
-        counts, side_effect = self._scripted({"2": ["", real]})
+        counts, side_effect = self._scripted({"2": [("", True), (real, False)]})
         active = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         with patch.object(
             s, "_read_active_credentials",
             return_value=ActiveCredentials(active, False),
         ), patch.object(
-            s, "_read_account_credentials", side_effect=side_effect,
+            s, "_read_account_credentials_ex", side_effect=side_effect,
         ), patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
             return_value=oauth.UsageOutcome(None),
@@ -9540,18 +9557,28 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
         # credentials is the third positional arg of try_fetch_usage_for_account
         assert slot_calls[0].args[2] == real
 
-    def test_genuinely_absent_backup_stays_empty_after_one_retry(
+    def test_genuinely_absent_backup_is_not_retried(
         self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
         mock_claude_config: Path,
     ):
         from claude_swap.json_output import USAGE_NO_CREDENTIALS
 
         s = self._switcher(sample_sequence_data)
-        counts, side_effect = self._scripted({"2": ["", ""]})
+        counts, side_effect = self._scripted({"2": [("", False)]})
+        rows = {row[0]: row for row in self._rows(s, side_effect)}
+        assert rows[2][5] == ""
+        assert counts["2"] == 1  # ("", False) is absent, not a failed read
+        assert s._static_usage_sentinel(rows[2]) == USAGE_NO_CREDENTIALS
+
+    def test_unreadable_on_both_reads_is_bounded(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        s = self._switcher(sample_sequence_data)
+        counts, side_effect = self._scripted({"2": [("", True), ("", True)]})
         rows = {row[0]: row for row in self._rows(s, side_effect)}
         assert rows[2][5] == ""
         assert counts["2"] == 2  # one retry, not a loop
-        assert s._static_usage_sentinel(rows[2]) == USAGE_NO_CREDENTIALS
 
     def test_nonempty_first_read_is_not_retried(
         self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
@@ -9559,10 +9586,112 @@ class TestBuildAccountsInfoRetriesEmptyBackupRead:
     ):
         real = json.dumps({"claudeAiOauth": {"accessToken": "sk-first"}})
         s = self._switcher(sample_sequence_data)
-        counts, side_effect = self._scripted({"2": [real]})
+        counts, side_effect = self._scripted({"2": [(real, False)]})
         rows = {row[0]: row for row in self._rows(s, side_effect)}
         assert rows[2][5] == real
         assert counts["2"] == 1
+
+    def test_keychain_error_then_success_reaches_row(
+        self, temp_home: Path, block_real_keychain, sample_sequence_data: dict,
+        mock_claude_config: Path, monkeypatch,
+    ):
+        """A real KeychainError on the first slot-2 backup lookup is retried.
+
+        Does not patch the switcher read methods — the store's own
+        ``get_password`` path has to surface the failure and the retry.
+        """
+        real = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-retried", "refreshToken": "rt-retried"},
+        })
+        s = self._switcher(sample_sequence_data)
+        email = sample_sequence_data["accounts"]["2"]["email"]
+        backup_user = f"account-2-{email}"
+        seen = {"n": 0}
+
+        def get_password(service, account):
+            if service == SECURITY_SERVICE and account == backup_user:
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    raise KeychainError("locked")
+                return real
+            return None
+
+        monkeypatch.setattr(macos_keychain, "get_password", get_password)
+        rows = {row[0]: row for row in s._build_accounts_info()}
+        assert rows[2][5] == real
+        assert seen["n"] == 2
+
+    @staticmethod
+    def _count_security(calls: list[list[str]], account: str) -> int:
+        """``security`` spawns whose argv names this backup account.
+
+        The wrapper's argv[0] is ``/usr/bin/security``, not ``security``.
+        """
+        n = 0
+        for argv in calls:
+            if not argv:
+                continue
+            exe = str(argv[0])
+            if exe != "security" and not exe.endswith("/security"):
+                continue
+            if account in argv:
+                n += 1
+        return n
+
+    def _security_budget(
+        self, s: ClaudeAccountSwitcher, email: str, returncode: int,
+    ) -> tuple[int, int]:
+        """(one ``_read_account_credentials_ex``, then ``_build_accounts_info``).
+
+        Counts ``security`` spawns for the inactive slot only. The active
+        slot's own Keychain reads are a different item and must not inflate
+        the backup budget.
+        """
+        account = f"account-2-{email}"
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            argv = list(args) if isinstance(args, (list, tuple)) else [str(args)]
+            exe = str(argv[0]) if argv else ""
+            if exe == "security" or exe.endswith("/security"):
+                calls.append(argv)
+                stderr = (
+                    "item could not be found" if returncode == 44
+                    else "User interaction is not allowed"
+                )
+                return subprocess.CompletedProcess(argv, returncode, "", stderr)
+            return real_run(args, **kwargs)
+
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake_run):
+            s._read_account_credentials_ex("2", email)
+            single = self._count_security(calls, account)
+            calls.clear()
+            s._build_accounts_info()
+            during = self._count_security(calls, account)
+        return single, during
+
+    @pytest.mark.no_keychain_fake
+    def test_missing_keychain_item_does_not_reread(
+        self, temp_home: Path, sample_sequence_data: dict, mock_claude_config: Path,
+    ):
+        s = self._switcher(sample_sequence_data)
+        email = sample_sequence_data["accounts"]["2"]["email"]
+        single, during = self._security_budget(s, email, 44)
+        assert single >= 1  # the fake actually saw a security spawn
+        # Absent item: the build's inactive-slot spawns equal one read.
+        assert during == single
+
+    @pytest.mark.no_keychain_fake
+    def test_locked_keychain_retries_security_once(
+        self, temp_home: Path, sample_sequence_data: dict, mock_claude_config: Path,
+    ):
+        s = self._switcher(sample_sequence_data)
+        email = sample_sequence_data["accounts"]["2"]["email"]
+        # 36: locked / "User interaction is not allowed" — not the not-found rc.
+        single, during = self._security_budget(s, email, 36)
+        assert single >= 1
+        assert during == 2 * single
 
 
 class TestSwitchUnreadableBackup:

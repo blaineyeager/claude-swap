@@ -279,6 +279,7 @@ class TestListJson:
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_read_account_credentials_ex", return_value=(backup_creds, False)), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
 
