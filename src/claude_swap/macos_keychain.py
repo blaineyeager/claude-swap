@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -82,11 +83,19 @@ _LOG_ENV = "CLAUDE_SWAP_KEYCHAIN_LOG"
 
 # Spawn circuit. Open on dialog/timeout/single-flight refuse; close on spawn
 # rc 0 or 44, :func:`reset_keychain_circuit` / ``cswap keychain-circuit reset``,
-# or after a TTL (default 300s, override ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL``).
-# ``no_keychain_env`` does not open it — that opt-out is process-local.
+# or after a TTL (default 300s, override ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL``,
+# capped at :data:`_CIRCUIT_TTL_MAX`). A refuse because the circuit is already
+# open does not rewrite the file — refreshing ``ts`` would restart the TTL and
+# a poller would never recover. ``no_keychain_env`` does not open it — that
+# opt-out is process-local. A ``ts`` further than :data:`_CIRCUIT_FUTURE_SKEW`
+# ahead of the wall clock is treated as expired (the clock stepped back).
 _CIRCUIT_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT"
 _CIRCUIT_TTL_ENV = "CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL"
 _CIRCUIT_TTL_DEFAULT = 300.0  # seconds
+_CIRCUIT_TTL_MAX = 3600.0  # seconds; larger overrides are clamped
+# How far a ``ts`` may sit in the future before it is treated as a clock jump
+# rather than a fresh open. A few seconds of writer/reader skew is normal.
+_CIRCUIT_FUTURE_SKEW = 60.0  # seconds
 # Absolute UTC, shared across processes. Monotonic clocks are not comparable
 # between processes and cannot be stored in this file.
 _CIRCUIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -189,7 +198,16 @@ def _circuit_path() -> Path:
     return Path.home() / ".claude" / "state" / "keychain-watch" / "circuit.json"
 
 
-def _write_circuit(*, open_: bool, reason: str) -> None:
+def _write_circuit(*, open_: bool, reason: str) -> bool:
+    """Persist the circuit flag. True when the file was replaced.
+
+    The write is atomic: a temp file in the same directory, then
+    ``os.replace``, so a reader never observes a partial JSON document. The
+    temp file is removed if the replace does not finish. Best-effort: any
+    failure returns False and leaves the previous file, if any, unchanged.
+    """
+    fd = -1
+    tmp_name: str | None = None
     try:
         path = _circuit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,17 +216,36 @@ def _write_circuit(*, open_: bool, reason: str) -> None:
             "reason": reason,
             "ts": time.strftime(_CIRCUIT_TS_FORMAT, time.gmtime()),
         }
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        os.write(fd, json.dumps(payload).encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, path)
+        return True
     except Exception:
-        return
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        return False
 
 
 def _circuit_ttl() -> float:
     """Seconds an open circuit stays open.
 
     ``CLAUDE_SWAP_KEYCHAIN_CIRCUIT_TTL`` overrides :data:`_CIRCUIT_TTL_DEFAULT`.
-    Missing, non-numeric, non-finite, or negative values fall back to the
-    default so a bad setting cannot disable the breaker or pin it open.
+    Anything that is not a finite positive number — missing, non-numeric,
+    non-finite (``nan`` / ``inf``), zero (``"0"``, ``"0.0"``, ``"-0"``), or
+    negative — falls back to the default. Zero would expire every open
+    circuit immediately and disable the breaker; a non-finite value cannot
+    be compared. Values above :data:`_CIRCUIT_TTL_MAX` are clamped so a huge
+    override cannot pin the breaker open for a day.
     """
     raw = os.environ.get(_CIRCUIT_TTL_ENV)
     if raw is None or raw.strip() == "":
@@ -217,8 +254,10 @@ def _circuit_ttl() -> float:
         value = float(raw)
     except ValueError:
         return _CIRCUIT_TTL_DEFAULT
-    if not math.isfinite(value) or value < 0:
+    if not math.isfinite(value) or value <= 0:
         return _CIRCUIT_TTL_DEFAULT
+    if value > _CIRCUIT_TTL_MAX:
+        return _CIRCUIT_TTL_MAX
     return value
 
 
@@ -242,28 +281,39 @@ def _circuit_is_open() -> bool:
     opened = _circuit_ts_epoch(data.get("ts"))
     # time.time() (wall clock), not monotonic: ``ts`` is absolute UTC shared
     # across processes. Missing or unparseable stamps count as expired so a
-    # corrupt file cannot wedge spawns forever.
-    if opened is None or (time.time() - opened) >= _circuit_ttl():
+    # corrupt file cannot wedge spawns forever. A stamp more than
+    # ``_CIRCUIT_FUTURE_SKEW`` ahead of now is also expired — the clock jumped
+    # backward, and waiting for wall time to catch the stamp would pin the
+    # breaker open. ``age == TTL`` is expired (the window is half-open).
+    if opened is None:
+        _close_circuit("expired")
+        return False
+    age = time.time() - opened
+    if age >= _circuit_ttl() or age < -_CIRCUIT_FUTURE_SKEW:
         _close_circuit("expired")
         return False
     return True
 
 
-def _open_circuit(reason: str) -> None:
-    _write_circuit(open_=True, reason=reason)
+def _open_circuit(reason: str) -> bool:
+    return _write_circuit(open_=True, reason=reason)
 
 
-def _close_circuit(reason: str = "ok") -> None:
-    _write_circuit(open_=False, reason=reason)
+def _close_circuit(reason: str = "ok") -> bool:
+    return _write_circuit(open_=False, reason=reason)
 
 
-def reset_keychain_circuit() -> None:
+def reset_keychain_circuit() -> bool:
     """Close the spawn circuit. Does not signal any leftover child.
 
     Same effect as ``cswap keychain-circuit reset``. An open circuit also
-    closes on its own after :func:`_circuit_ttl` (default 300s).
+    closes on its own after :func:`_circuit_ttl` (default 300s, never above
+    :data:`_CIRCUIT_TTL_MAX`).
+
+    Returns True when the closed state was written. Returns False when the
+    write failed; the previous file, if any, is left unchanged.
     """
-    _close_circuit()
+    return _close_circuit()
 
 
 def _ps_text() -> str:
@@ -334,7 +384,10 @@ def _spawn_refuse_reason() -> str | None:
 def _refuse_spawn(argv: list[str], reason: str) -> None:
     # Opt-out is process-env, not a durable host fault. Opening the circuit
     # here would keep refusing after the env is gone (until the TTL or a reset).
-    if reason != "no_keychain_env":
+    # An already-open circuit must not be rewritten either: ``_open_circuit``
+    # stamps ``ts`` as now, which restarts the TTL, so a once-a-minute poller
+    # never reaches expiry.
+    if reason not in ("no_keychain_env", "circuit_open"):
         _open_circuit(reason)
     _log_security_event(
         {

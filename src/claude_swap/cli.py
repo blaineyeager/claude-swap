@@ -394,6 +394,8 @@ def _keychain_circuit_command(argv: list[str]) -> None:
     An open circuit refuses ``security`` spawns after a dialog, a timeout, or
     a single-flight collision. It also closes on a successful spawn (rc 0/44)
     and on its own after a TTL; this is the operator path that does not wait.
+    A failed write prints to stderr and exits non-zero — the on-disk circuit
+    is left as it was.
     """
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} keychain-circuit",
@@ -411,7 +413,9 @@ def _keychain_circuit_command(argv: list[str]) -> None:
     if args.action == "reset":
         from claude_swap import macos_keychain
 
-        macos_keychain.reset_keychain_circuit()
+        if not macos_keychain.reset_keychain_circuit():
+            error("Error: failed to reset the Keychain spawn circuit")
+            sys.exit(1)
         print("Keychain spawn circuit reset (closed)")
 
 
